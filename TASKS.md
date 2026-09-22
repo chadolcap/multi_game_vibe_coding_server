@@ -143,57 +143,67 @@ Phase 9  부하 테스트 / 배포 준비  (300명 동시 접속 확인)
 **목표:** `(partner, mid)` 로 유저를 찾고, 없으면 새로 만들고, Redis 에 캐시하는 기능을 **게임과 상관없이** 먼저 완성한다.
 
 ### 2-1. userid 변환 (`src/common/userid.ts`)
-- [ ] `ConvertMidToUserid(partner, mid)` 구현
+- [x] `ConvertMidToUserid(partner, mid)` 구현
   - mid 의 글자마다 `문자코드 ^ 5` → 10진수 문자열로 이어 붙이기 (예: `'u'(117) ^ 5 = 112` → `"112"`)
   - 결과: `partner + "_" + 변환값`
-- [ ] 입력 검사 함수
+- [x] 입력 검사 함수
   - partner: 영문/숫자 1~11자(`_` 금지)
   - mid: 영문/숫자 1~63자
   - gender: `F` 또는 `M` 만 허용
   - phone: **빈 값 불가**, 텍스트 최대 100자
-- [ ] 간단한 테스트: 같은 입력 → 항상 같은 결과, 다른 partner → 다른 결과
+- [x] 간단한 테스트: 같은 입력 → 항상 같은 결과, 다른 partner → 다른 결과
+  - `ConvertMidToUserid("p", "u")` → `"p_112"` (CLAUDE.md 예시와 일치 확인)
+  - `IsValidPartner`/`IsValidMid` 로 `_` 포함, 길이 초과, 한글 등 형식 오류도 확인
 
 ### 2-2. DB 스키마 (`src/db/schema.sql`)
-- [ ] `user_partner_info` — partner, mid, gender, userid
-- [ ] `user_member_info` — userid, name, avatar, phone, join_date, login_date, certification_date, terms_date
-- [ ] `user_play_info` — userid, total_game_count, total_win_count, today_game_count, today_win_count
-- [ ] `user_member_info.phone` — `VARCHAR(100)`
-- [ ] `game_log_YYYY_MM` — start_time, end_time, win, lose, score, plays, win_is_bot, lose_is_bot (월별 테이블, Phase 5 에서 사용)
-  - 승자/패자 각각 게임 종료 시 **유저가 했는지 봇이 했는지** 기록하는 컬럼 추가 (예: `win_is_bot`, `lose_is_bot`)
-  - 최종 스코어 컬럼 `score` — 승자 기준 `"2:0"` / `"2:1"` 문자열
-  - 판별 기록 `plays` — **JSON 배열 컬럼 하나**에 무승부 판까지 모든 판을 순서대로 저장 (무승부는 개수 제한 없음)
-    - 예: `[{"win":"R","lose":"S"},{"draw":"P"},{"win":"S","lose":"P"}]` (정확한 모양은 이 단계에서 확정)
-    - 판 수가 정해져 있지 않아 play1~playN 고정 컬럼으로는 담을 수 없기 때문
-  - 2선승제라 2판 또는 3판, 무승부가 있으면 더 많은 판이 기록될 수 있음 → 판별 기록을 어떤 형태로 저장할지 결정 (예: JSON 컬럼 1개 vs play1~playN 컬럼)
-- [ ] `rank_daily`, `rank_weekly` (Phase 8 에서 사용)
-- [ ] userid 를 담는 모든 컬럼은 `VARCHAR(255)`, partner 는 `VARCHAR(16)`, mid 는 `VARCHAR(64)`
-- [ ] 모두 `CREATE TABLE IF NOT EXISTS` 로 작성 (여러 번 실행해도 안전)
+- [x] `user_partner_info` — userid(PK), partner, mid, gender, created_at / UNIQUE(partner, mid)
+- [x] `user_member_info` — userid, name, avatar, phone, join_date, login_date, certification_date, terms_date
+- [x] `user_play_info` — userid, total_game_count, total_win_count, today_game_count, today_win_count, today_date (score_max 없음)
+- [x] `user_member_info.phone` — `VARCHAR(100)`
+- [x] `game_log_YYYY_MM` — start_time, end_time, win, lose, score, plays, win_is_bot, lose_is_bot (월별 테이블)
+  - `src/db/gameLogSchema.ts` 에 `GetGameLogTableName(date)` / `EnsureGameLogTable(pool, date)` 로 구현 (테이블명이 매달 바뀌어 schema.sql 에는 못 넣음)
+  - plays 는 `JSON` 컬럼 — 무승부 포함 모든 판을 배열로 저장. 정확한 원소 모양은 Phase 5 에서 확정
+  - `npm run db:init` 이 이번 달 테이블을 미리 만들어 둔다. 다음 달 것은 Phase 5 에서 로그 쓰기 직전에 `EnsureGameLogTable` 호출
+- [x] `rank_daily`, `rank_weekly` (Phase 8 에서 사용)
+- [x] userid 를 담는 모든 컬럼은 `VARCHAR(255)`, partner 는 `VARCHAR(16)`, mid 는 `VARCHAR(64)`
+- [x] 모두 `CREATE TABLE IF NOT EXISTS` 로 작성 (여러 번 실행해도 안전)
+
+> ⚠️ **실행 중 발견한 문제:** `rps_game` DB 에 이미 다른 구조의 테이블이 있었다 (phone VARCHAR(20), score_max 존재, `game_log_YYYY_MM` 대신 `game_result_log` 테이블 1개). `IF NOT EXISTS` 라 조용히 넘어가고 실제로는 0개 테이블만 생성됐던 것을 확인 후, 전부 빈 테이블임을 확인하고 지운 뒤 이 설계대로 다시 만들었다. **다른 개발 PC 에서 `db:init` 하기 전에도 기존 테이블 유무를 먼저 확인할 것.**
 
 ### 2-3. DB 연결 / 초기화
-- [ ] `db/connection.ts` — MySQL connection pool
-- [ ] `db/initDb.ts` — DB 생성 + 스키마 적용, `npm run db:init` 으로 실행
+- [x] `db/connection.ts` — MySQL connection pool (mysql2/promise)
+- [x] `db/initDb.ts` — DB 생성 + 스키마 적용, `npm run db:init` 으로 실행
+  - schema.sql 은 tsc 가 컴파일하지 않으므로 `scripts/copy-assets.mjs` 가 빌드 때 `dist/db/` 로 복사한다
+  - ⚠️ **버그 수정:** 세미콜론으로 SQL 문을 나눌 때, `-- 설명` 주석이 CREATE TABLE 문 바로 위에 붙어 있어서
+    "주석으로 시작하면 버린다"는 필터가 문장 전체를 걸러 버렸다 (처음 실행 시 "테이블 0개 생성"으로 조용히 실패).
+    주석 줄만 먼저 지우고 나서 세미콜론으로 나누도록 고쳤다.
 
 ### 2-4. 쿼리 모듈 (`src/db/queries/`)
-- [ ] `userPartnerInfo.ts` — (partner, mid) → userid 조회
-- [ ] `userInfo.ts` — user_member_info + user_play_info 조회
-- [ ] phone 갱신 쿼리 — 기존 유저가 저장된 값과 **다른 phone** 을 보내면 user_member_info.phone 업데이트 (같으면 쓰지 않음)
-- [ ] `userRegistration.ts` — 첫 접속 유저를 3개 테이블에 **한 트랜잭션**으로 등록 (gender 는 user_partner_info, phone 은 user_member_info 에 저장)
-  - 동시에 두 번 호출돼도 한 번만 만들어지게 (`INSERT IGNORE` 또는 UNIQUE 키 활용)
+- [x] `userPartnerInfo.ts` — (partner, mid) → userid 조회
+- [x] `userInfo.ts` — user_partner_info + user_member_info + user_play_info 조회 (phone 포함, DB 내부용 `CachedUserInfo`)
+- [x] phone 갱신 쿼리 — 기존 유저가 저장된 값과 **다른 phone** 을 보내면 user_member_info.phone 업데이트 (같으면 쓰지 않음, `UpdatePhoneIfChanged`)
+- [x] `userRegistration.ts` — 첫 접속 유저를 3개 테이블에 **한 트랜잭션**으로 등록 (gender 는 user_partner_info, phone 은 user_member_info 에 저장)
+  - 동시에 두 번 호출돼도 한 번만 만들어지게 `INSERT IGNORE` 사용
 
 ### 2-5. Redis
-- [ ] `db/redis.ts` — Redis 연결(포트는 `.env` 에서) + JSON 저장/조회/삭제 헬퍼
-- [ ] `db/userCache.ts` — 키 `user:info:{userid}`, TTL 120초(2분)
-  - [ ] `SaveUserCache(user)` — 값 저장 + TTL 설정 (값이 **바뀔 때** 호출)
-  - [ ] `TouchUserCache(user)` — TTL 만 120초로 다시 설정, 키가 이미 없으면 `SaveUserCache` 로 다시 저장 (**떠날 때** 호출)
-- [ ] `db/userRepository.ts` — 유저 조회의 **유일한 입구**
+- [x] `db/redis.ts` — Redis 연결(포트는 `.env` 에서) + JSON 저장/조회/삭제 헬퍼 (ioredis)
+  - ⚠️ ioredis 는 CJS 패키지라 `import Redis from "ioredis"` 기본 import 가 TypeScript 7 + `module: nodenext` 조합에서 타입 에러가 났다.
+    `import { Redis } from "ioredis"` **named import** 로 바꿔서 해결 (tsconfig 에 `esModuleInterop: true` 도 추가)
+- [x] `db/userCache.ts` — 키 `user:info:{userid}`, TTL 120초(2분)
+  - [x] `SaveUserCache(user)` — 값 저장 + TTL 설정 (값이 **바뀔 때** 호출)
+  - [x] `TouchUserCache(user)` — TTL 만 120초로 다시 설정, 키가 이미 없으면 `SaveUserCache` 로 다시 저장 (**떠날 때** 호출)
+- [x] `db/userRepository.ts` — 유저 조회의 **유일한 입구** (`GetOrCreateUser`)
   - Redis 에 있으면 Redis 값 사용 → 없으면 DB 조회 → DB 에도 없으면 새로 등록
   - DB 에서 가져왔거나 새로 만든 경우 바로 Redis 에 저장
+  - phone 이 바뀌었으면 DB/Redis 갱신 (write-through)
+  - `db/types.ts` 의 `CachedUserInfo`(phone 포함, 서버 내부용) / `common/types.ts` 의 `UserInfo`(phone 제외, 클라이언트용) 로 구분
+    → `ToPublicUserInfo()` 로 변환해서 반환. phone 은 Redis 캐시(서버 내부)에는 들어가지만, 클라이언트나 좌석 예약에는 나가지 않는다
 
 **완료 확인**
-- [ ] `npm run db:init` 으로 테이블이 생성된다.
-- [ ] 테스트 스크립트로: 처음 부르면 "새 유저", 두 번째 부르면 "기존 유저" 가 나온다.
-- [ ] 두 번째 조회는 DB 가 아니라 Redis 에서 온다. (로그로 확인)
-- [ ] Redis 에 저장한 값이 2분 뒤 사라진다. (`redis-cli -p 6780 TTL user:info:...` 로 확인)
+- [x] `npm run db:init` 으로 테이블이 생성된다. (2026-09-22, 5개 테이블 + 이번 달 game_log)
+- [x] 테스트 스크립트로: 처음 부르면 "새 유저"(`is_new_user: true`), 두 번째 부르면 "기존 유저" 가 나온다.
+- [x] 두 번째 조회는 DB 가 아니라 Redis 에서 온다. (Redis 키를 지운 뒤 다시 불러도 DB 에서 정상 조회되는 것까지 확인)
+- [x] Redis 에 저장한 값의 TTL 이 120초로 잡힌다. (`redis-cli -p 6780 TTL user:info:...` 로 확인)
 
 > 💡 **왜 userRepository 한 곳만 거치나요?** 로비/게임/Watcher 매니저가 각자 SQL 을 짜면, 캐시 규칙(Redis 먼저 → DB)을 빠뜨리는 곳이 생깁니다. 입구를 하나로 두면 규칙이 항상 지켜집니다.
 

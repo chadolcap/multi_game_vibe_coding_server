@@ -55,7 +55,14 @@ export const config = {
     tls_cert_path: ReadString("TLS_CERT_PATH", ""),
     tls_key_path: ReadString("TLS_KEY_PATH", ""),
 
-    // Redis (Phase 2 에서 사용)
+    // Redis
     redis_host: ReadString("REDIS_HOST", "127.0.0.1"),
     redis_port: ReadNumber("REDIS_PORT", 6780),
+
+    // MySQL — 계정/비밀번호는 기본값을 두지 않는다 (.env 필수)
+    db_host: ReadString("DB_HOST", "127.0.0.1"),
+    db_port: ReadNumber("DB_PORT", 3306),
+    db_user: ReadString("DB_USER", ""),
+    db_password: ReadString("DB_PASSWORD", ""),
+    db_name: ReadString("DB_NAME", ""),
 } as const;

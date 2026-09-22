@@ -47,3 +47,24 @@ export interface ErrorPayload {
     code: ErrorCode;
     message: string;
 }
+
+// ENTER_LOBBY 로 클라이언트가 보내는 값 (CLAUDE.md 접속 순서 1번)
+export interface EnterLobbyPayload {
+    partner: string;
+    mid: string;
+    gender: string;
+    phone: string;
+}
+
+// 로비/게임에서 쓰는 유저 정보 — Redis 캐시, LOBBY_ENTERED 응답, 좌석 예약에 담기는 값의 바탕이 된다.
+// phone 처럼 개인정보 성격이 강한 값은 여기에 넣지 않는다 (userRepository 안에서만 사용)
+export interface UserInfo {
+    userid: string;
+    name: string;
+    avatar: string;
+    gender: string;
+    total_game_count: number;
+    total_win_count: number;
+    today_game_count: number;
+    today_win_count: number;
+}

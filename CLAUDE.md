@@ -12,10 +12,13 @@
 - Language: TypeScript
 - Multiplayer Framework: Colyseus **0.18** (`@colyseus/core` 0.18.15 + `@colyseus/ws-transport` 0.18.2, 통합 패키지 `colyseus` 는 쓰지 않음)
   - `express` 는 ws-transport 가 내부에서 불러오기 때문에 설치만 해 둔다 (HTTP API 용도 아님)
-  - 모듈 형식: ESM (`"type": "module"`), TypeScript 7, 상대 경로 import 는 `.js` 확장자로 쓴다
+  - 모듈 형식: ESM (`"type": "module"`), TypeScript 7 (`esModuleInterop: true`), 상대 경로 import 는 `.js` 확장자로 쓴다
   - 실행: `npm run build` 후 `node dist/index.js <watcher|lobby|game> <채널 번호(1부터)>` (채널별 npm 스크립트 `start:lobby1` 등)
-- DB: MySQL (개발 PC: XAMPP 의 MariaDB 10.4, MySQL 호환)
-- Cache / 세션 저장: Redis(port 6780) (개발 PC: Redis 3.0.504 를 `redis/redis-6780.conf` 로 별도 실행. 기존 6379 서비스는 다른 용도라 건드리지 않는다)
+  - `npm run build` 는 `tsc` 뒤에 `scripts/copy-assets.mjs` 를 실행해 `.sql` 등 정적 파일을 `dist/` 로 복사한다 (tsc 가 컴파일하지 않으므로)
+- DB: MySQL — 드라이버 `mysql2` (개발 PC: XAMPP 의 MariaDB 10.4, MySQL 호환. root 계정 비밀번호 없음)
+- Cache / 세션 저장: Redis(port 6780) — 클라이언트 `ioredis`
+  - `import { Redis } from "ioredis"` **named import** 로 쓴다. 기본 import(`import Redis from "ioredis"`)는 ioredis(CJS) + TypeScript 7 + `module: nodenext` 조합에서 타입 에러가 난다.
+  - 개발 PC: Redis 3.0.504 를 `redis/redis-6780.conf` 로 별도 실행. 기존 6379 서비스는 다른 용도라 건드리지 않는다
 - 클라이언트-서버 통신 포맷: JSON
 - 통신 방식: **모든 통신은 소켓**으로 한다 (HTTP API 없음). 관리자 페이지도 동일.
   (Colyseus 가 방 입장 전 매칭 요청 `POST /matchmake/...` 을 같은 포트의 HTTP 로 처리하는 것은 프레임워크 내부 동작이라 예외)
@@ -62,23 +65,27 @@ src/
       RoomManager.ts        # 로비에서 온 유저를 room 에 입장 시키기, GameRoom 을 감시하여 참여자를 입장 시키는 역활
       GameRoom.ts	        # 실제 게임룰이 진행 되는 모듈. 종료 시 Lobby로 복귀(2인이 게임을 하는 로직이 실행 됨. 게임방이 100개라면 GameRoom 클래스가 100개 생성 되는 방식)
   db/
-    connection.ts           # MySQL connection pool 관리
-    redis.ts                # Redis 클라이언트 관리 + JSON 저장/조회/삭제 헬퍼, 채널간 공유 정보 저장
+    connection.ts           # MySQL connection pool 관리 (mysql2/promise)
+    redis.ts                # Redis 클라이언트 관리 + JSON 저장/조회/삭제 헬퍼, 채널간 공유 정보 저장 (ioredis)
     userCache.ts            # 유저 정보 Redis 캐시 (키 user:info:{userid}, TTL 120초)
     userRepository.ts       # 유저 정보 조회 진입점 (Redis → DB 순). 매니저는 이 모듈만 호출
-    schema.sql              # 테이블 스키마 (CREATE TABLE IF NOT EXISTS)
-    initDb.ts               # DB 생성 + 스키마 적용 (npm run db:init)
+    types.ts                # DB/Redis 전용 타입. CachedUserInfo(phone 포함, 서버 내부용) → ToPublicUserInfo() 로 UserInfo(phone 제외) 변환
+    schema.sql               # 테이블 스키마 (CREATE TABLE IF NOT EXISTS). game_log_YYYY_MM 은 이름이 매달 바뀌어 여기 없음
+    gameLogSchema.ts         # game_log_YYYY_MM 동적 생성 (GetGameLogTableName, EnsureGameLogTable)
+    initDb.ts               # DB 생성 + 스키마 적용 + 이번 달 game_log 테이블 생성 (npm run db:init)
     queries/                # 테이블별 쿼리 모듈
       userPartnerInfo.ts    # (partner, mid) → userid 조회
-      userInfo.ts           # user_member_info + user_play_info 조회 (UserInfo)
-      userRegistration.ts   # 첫 접속 유저 등록 (3개 테이블, 한 트랜잭션, 중복 호출에 안전)
+      userInfo.ts           # user_partner_info + user_member_info + user_play_info 조회 (CachedUserInfo)
+      userRegistration.ts   # 첫 접속 유저 등록(3개 테이블, 한 트랜잭션, 중복 호출에 안전) + phone 갱신 쿼리
   common/
-    config.ts               # .env 로딩 및 설정 값
+    config.ts               # .env 로딩 및 설정 값 (채널 포트, TLS, Redis, MySQL)
     constants.ts            # 규모 스펙/게임 규칙 상수
     channelNames.ts         # 채널 ID / 룸 이름 / 포트 규칙 (lobby_N, game_N, 채널 ID 는 lobby-1 / game-3 처럼 종류별로 1부터)
     messages.ts             # 클라이언트 메시지 송수신 헬퍼 (SendMessage / SendError / ReadPayload)
-    userid.ts               # (partner, mid) → userid 변환
-    types.ts                # 메시지 타입, envelope, 공통 타입
+    userid.ts               # (partner, mid) → userid 변환 + partner/mid/gender/phone 형식 검사
+    types.ts                # 메시지 타입, envelope, 공통 타입, EnterLobbyPayload, UserInfo(phone 제외)
+scripts/
+  copy-assets.mjs           # tsc 가 컴파일하지 않는 정적 파일(schema.sql 등)을 빌드 후 dist/ 로 복사
     ...                     # 기타 유틸
 ```
 
@@ -171,16 +178,23 @@ src/
     - 점수는 rank_daily / rank_weekly 에 누적한다.
 
 ## DB 테이블 기본 구성
-- user_partner_info(파트너사의 유저 기본 정보) : partner, mid, gender, userid
-- user_member_info(유저의 기본 정보) : userid, name, avatar, phone, join_date, login_date, certification_date(본인 인증 날짜), terms_date(약관인증 동의 날짜)
-- user_play_info(유저의 게임 play 정보) : userid, total_game_count, total_win_count, today_game_count, today_win_count
-- game_log_2026_09(게임 로그 정보) : start_time, end_time, win(승자 userid), lose(패자 userid), play1(첫번째 판의 가위바위보낸 내역), play2.....
-  - 승자/패자 각각 **게임이 끝날 때 유저가 직접 했는지, 봇이 했는지** 기록한다 (예: win_is_bot, lose_is_bot)
+
+구현: `src/db/schema.sql` (`npm run db:init` 으로 적용, 여러 번 실행해도 안전). 실제 컬럼 목록은 그 파일이 기준이다.
+
+- user_partner_info(파트너사의 유저 기본 정보) : userid(PK), partner, mid, gender, created_at / UNIQUE(partner, mid)
+- user_member_info(유저의 기본 정보) : userid(PK, FK→user_partner_info), name, avatar, phone(VARCHAR(100)), join_date, login_date, certification_date(본인 인증 날짜), terms_date(약관인증 동의 날짜)
+- user_play_info(유저의 게임 play 정보) : userid(PK, FK→user_partner_info), total_game_count, total_win_count, today_game_count, today_win_count, today_date (score_max 는 두지 않는다 — 점수는 rank_daily/rank_weekly 에서만 관리)
+- game_log_2026_09(게임 로그 정보, 월별) : start_time, end_time, win(승자 userid), lose(패자 userid), score, plays, win_is_bot, lose_is_bot
+  - 테이블 이름이 매달 바뀌므로 schema.sql 에 없다. `src/db/gameLogSchema.ts` 의 `EnsureGameLogTable()` 이 필요할 때 동적으로 만든다 (`db:init` 이 이번 달 것을 미리 만들어 둠)
+  - 승자/패자 각각 **게임이 끝날 때 유저가 직접 했는지, 봇이 했는지** 기록한다 (win_is_bot, lose_is_bot)
   - 최종 스코어는 승자 기준 `"2:0"` / `"2:1"` 문자열로 score 컬럼에 저장한다. 판별 가위바위보 값도 계속 기록한다.
   - 무승부 판은 **개수 제한 없이** 모두 기록한다. 판 수가 정해져 있지 않으므로 play1~playN 고정 컬럼 대신
     **plays 컬럼 하나(JSON 배열)** 에 무승부 판을 포함한 모든 판을 순서대로 저장한다.
 - rank_weekly (주간 랭킹 테이블/월요일 리셋/date_start 로 주간별 정보 체크) : date_start, userid, score
 - rank_daily (일일 랭킹 테이블) : date_game, userid, score
+
+> ⚠️ 개발 PC 의 `rps_game` DB 에 이 설계와 다른 옛 테이블(phone VARCHAR(20), score_max 있음, `game_result_log` 단일 테이블)이 미리 있었던 적이 있다.
+> 전부 빈 테이블이라 지우고 이 설계로 다시 만들었다. **다른 환경에서 `db:init` 하기 전에도 기존 테이블 구조를 먼저 확인할 것.**
 - "오늘"의 기준은 매일 00:00:00 ~ 23:59:59 (서버 시간 KST 기준). today_game_count / today_win_count 와 rank_daily 모두 이 기준을 따른다.
 - 랭킹은 **1~100위**까지 보여 주고, 조회한 유저 **본인의 순위와 점수**를 함께 보여 준다 (100위 밖이어도 표시).
 - 필요한 테이블 추가 생성
