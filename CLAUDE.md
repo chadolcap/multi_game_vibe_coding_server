@@ -10,11 +10,15 @@
 
 - Runtime: Node.js
 - Language: TypeScript
-- Multiplayer Framework: Colyseus (Phase 1 설치 시점의 최신 안정판으로 고정 — 설치 후 버전을 여기에 기록)
+- Multiplayer Framework: Colyseus **0.18** (`@colyseus/core` 0.18.15 + `@colyseus/ws-transport` 0.18.2, 통합 패키지 `colyseus` 는 쓰지 않음)
+  - `express` 는 ws-transport 가 내부에서 불러오기 때문에 설치만 해 둔다 (HTTP API 용도 아님)
+  - 모듈 형식: ESM (`"type": "module"`), TypeScript 7, 상대 경로 import 는 `.js` 확장자로 쓴다
+  - 실행: `npm run build` 후 `node dist/index.js <watcher|lobby|game> <채널 번호(1부터)>` (채널별 npm 스크립트 `start:lobby1` 등)
 - DB: MySQL (개발 PC: XAMPP 의 MariaDB 10.4, MySQL 호환)
 - Cache / 세션 저장: Redis(port 6780) (개발 PC: Redis 3.0.504 를 `redis/redis-6780.conf` 로 별도 실행. 기존 6379 서비스는 다른 용도라 건드리지 않는다)
 - 클라이언트-서버 통신 포맷: JSON
 - 통신 방식: **모든 통신은 소켓**으로 한다 (HTTP API 없음). 관리자 페이지도 동일.
+  (Colyseus 가 방 입장 전 매칭 요청 `POST /matchmake/...` 을 같은 포트의 HTTP 로 처리하는 것은 프레임워크 내부 동작이라 예외)
 - 암호화: Watcher / 로비 / 게임 **모든 채널에 wss(TLS)** 적용. 인증서 경로는 .env 로 관리하고, 개발 환경에서만 ws 로 켤 수 있게 설정으로 분리한다.
 
 ## 규모 스펙
@@ -25,8 +29,8 @@
   | 채널 | 룸 이름 | 포트 |
   |---|---|---|
   | Watcher | - | 6000 |
-  | 로비 0 / 로비 1 | `lobby_0` / `lobby_1` | 6001 / 6002 |
-  | 게임 0 / 게임 1 / 게임 2 | `game_0` / `game_1` / `game_2` | 7001 / 7002 / 7003 |
+  | 로비 1 / 로비 2 | `lobby_1` / `lobby_2` | 6011 / 6012 |
+  | 게임 1 / 게임 2 / 게임 3 | `game_1` / `game_2` / `game_3` | 6021 / 6022 / 6023 |
 - 로비와 게임 채널별 최대 동시 접속 인원: 300명
 - 게임(Room) 채널별 방 개수: 100개, 인원 : 200명
 - 게임방 1개당 인원: 2명 (채널당 동시 게임 인원 200명, 나머지 200명은 로비 대기)
@@ -71,7 +75,7 @@ src/
   common/
     config.ts               # .env 로딩 및 설정 값
     constants.ts            # 규모 스펙/게임 규칙 상수
-    channelNames.ts         # 채널 ID / 룸 이름 규칙 (channel-N, lobby_N, game_N)
+    channelNames.ts         # 채널 ID / 룸 이름 / 포트 규칙 (lobby_N, game_N, 채널 ID 는 lobby-1 / game-3 처럼 종류별로 1부터)
     messages.ts             # 클라이언트 메시지 송수신 헬퍼 (SendMessage / SendError / ReadPayload)
     userid.ts               # (partner, mid) → userid 변환
     types.ts                # 메시지 타입, envelope, 공통 타입
@@ -80,10 +84,10 @@ src/
 
 ## 채널 / 룸 구성
 
-- 채널 번호(N)는 0부터, 채널 ID 는 1부터
+- 채널 번호(N)는 **1부터**. 채널 ID 와 같은 값이다 (예: 로비 1번 채널 = `lobby-1` = 룸 이름 `lobby_1` = 포트 6011).
 - Colyseus 룸 이름은 채널마다 따로 등록하며, 채널별 통계도 이 이름으로 구분한다.
-  - 로비 룸: `lobby_0`, `lobby_1` — 채널당 **1개**, 서버 기동 시 ChannelManager 가 생성 (`autoDispose=false`)
-  - 게임 룸: `game_0`, `game_1`, `game_2` — 채널당 최대 100개, RoomManager 가 필요할 때 생성 (Phase 4)
+  - 로비 룸: `lobby_1`, `lobby_2` — 채널당 **1개**, 서버 기동 시 ChannelManager 가 생성 (`autoDispose=false`)
+  - 게임 룸: `game_1`, `game_2`, `game_3` — 채널당 최대 100개, RoomManager 가 필요할 때 생성 (Phase 4)
 - 클라이언트에서 로비 소켓 접속(2개의 채널에 랜덤하게)  -> 로비 접속 후 게임 참여 버튼 -> 서버에서 룸채널에서 참여 가능한 채널 정보를 정보 전달 -> 로비 소켓 끊고 -> 받은 정보의 소켓 연결
 - 클라이언트 연결은 **이동형**: 로비 룸에 접속 → 매칭되면 로비를 떠나 게임 룸으로 이동 → 종료 후 로비로 복귀. (연결은 항상 1개)
 

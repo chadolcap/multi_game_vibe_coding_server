@@ -1,0 +1,43 @@
+{
+  "name": "server",
+  "version": "1.0.0",
+  "description": "실시간 2인 대전 보드게임(가위바위보) Colyseus 서버",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc && node dist/index.js lobby 1",
+    "start": "node dist/index.js",
+    "start:watcher": "node dist/index.js watcher 1",
+    "start:lobby1": "node dist/index.js lobby 1",
+    "start:lobby2": "node dist/index.js lobby 2",
+    "start:game1": "node dist/index.js game 1",
+    "start:game2": "node dist/index.js game 2",
+    "start:game3": "node dist/index.js game 3",
+    "redis": "\"C:\\Program Files\\Redis\\redis-server.exe\" redis/redis-6780.conf",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chadolcap/multi_game_vibe_coding_server.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bugs": {
+    "url": "https://github.com/chadolcap/multi_game_vibe_coding_server/issues"
+  },
+  "homepage": "https://github.com/chadolcap/multi_game_vibe_coding_server#readme",
+  "dependencies": {
+    "@colyseus/core": "^0.18.15",
+    "@colyseus/ws-transport": "^0.18.2",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.6",
+    "typescript": "^7.0.2"
+  }
+}
