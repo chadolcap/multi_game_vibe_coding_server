@@ -59,8 +59,10 @@ src/
                              공지는 관리자가 입력하는 즉시 **전체 채널(로비 + 게임)의 모든 유저**에게 실시간 전송한다 (예약 발송 없음).
   game/
     lobby/
-      LobbyManager.ts       # 로비 접속 유저 정보 처리. 게임 참여를 선택하면 게임 채널의 참여 가능한 방정보를 클라이언트에 전달 한다.
-      LobbyRoom.ts          # 로비에서 이뤄지는 구매, 광고 보기 등의 컨텐츠 처리
+      LobbyManager.ts       # ENTER_LOBBY 처리(형식 검사 → userRepository 조회/등록 → 대기 목록), ALREADY_CONNECTED/ALREADY_ENTERED 판단.
+                             게임 참여를 선택하면 게임 채널의 참여 가능한 방정보를 클라이언트에 전달 한다 (Phase 4)
+      LobbyRoom.ts          # 소켓 이벤트(onJoin/onMessage/onLeave)를 받아 LobbyManager 에 위임. ENTER_TIMEOUT 타이머, CHANNEL_FULL 인원 검사.
+                             나중에 로비에서 이뤄지는 구매, 광고 보기 등의 컨텐츠 처리도 여기 추가
     room/
       RoomManager.ts        # 로비에서 온 유저를 room 에 입장 시키기, GameRoom 을 감시하여 참여자를 입장 시키는 역활
       GameRoom.ts	        # 실제 게임룰이 진행 되는 모듈. 종료 시 Lobby로 복귀(2인이 게임을 하는 로직이 실행 됨. 게임방이 100개라면 GameRoom 클래스가 100개 생성 되는 방식)
@@ -93,7 +95,8 @@ scripts/
 
 - 채널 번호(N)는 **1부터**. 채널 ID 와 같은 값이다 (예: 로비 1번 채널 = `lobby-1` = 룸 이름 `lobby_1` = 포트 6011).
 - Colyseus 룸 이름은 채널마다 따로 등록하며, 채널별 통계도 이 이름으로 구분한다.
-  - 로비 룸: `lobby_1`, `lobby_2` — 채널당 **1개**, 서버 기동 시 ChannelManager 가 생성 (`autoDispose=false`)
+  - 로비 룸: `lobby_1`, `lobby_2` — 채널당 **1개**, 서버 기동 시(`index.ts`) `matchMaker.createRoom()` 으로 미리 생성 (`autoDispose=false`)
+    - `matchMaker.createRoom()` 은 `server.listen()` **이후**에 호출해야 한다 (`matchMaker.accept()` 가 `listen()` 안에서 실행됨)
   - 게임 룸: `game_1`, `game_2`, `game_3` — 채널당 최대 100개, RoomManager 가 필요할 때 생성 (Phase 4)
 - 클라이언트에서 로비 소켓 접속(2개의 채널에 랜덤하게)  -> 로비 접속 후 게임 참여 버튼 -> 서버에서 룸채널에서 참여 가능한 채널 정보를 정보 전달 -> 로비 소켓 끊고 -> 받은 정보의 소켓 연결
 - 클라이언트 연결은 **이동형**: 로비 룸에 접속 → 매칭되면 로비를 떠나 게임 룸으로 이동 → 종료 후 로비로 복귀. (연결은 항상 1개)
@@ -259,4 +262,9 @@ Colyseus 메시지 이름 = `type`, 메시지 본문 = envelope.
 - 연결 종료/재접속 시나리오를 각 매니저에서 반드시 고려한다.
 - 1차 구현은 `partner + mid` 만으로 유저를 식별한다 (별도 인증 없음). 파트너사 토큰 검증은 추후 추가하므로,
   `ENTER_LOBBY` 검증 코드는 인증 단계를 끼워 넣기 쉬운 구조로 둔다. (XOR userid 변환은 암호화가 아니라 형식 변환이다)
+- ⚠️ **Colyseus `onJoin` 안에서는 클라이언트에 메시지를 보내도 바로 전달되지 않는다.** 클라이언트가 `JOIN_ROOM`
+  핸드셰이크(접속 직후 자동으로 보내는 확인 신호)를 마치기 전까지, 서버가 보낸 메시지는 큐에 쌓이기만 하고
+  실제로는 전송되지 않는다. `onJoin` 에서 검사해서 바로 `client.leave()` 로 끊어야 하는 로직(예: 인원 제한)이 있다면,
+  `onJoin` 이 아니라 **클라이언트가 첫 메시지를 보내는 시점**(예: `ENTER_LOBBY`, GameRoom 의 `ROOM_ENTER_ACK`)에서
+  검사해야 클라이언트가 에러 내용을 실제로 받는다. (Phase 3 의 `CHANNEL_FULL` 에서 실제로 겪은 버그 — TASKS.md 참고)
 

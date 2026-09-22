@@ -214,38 +214,58 @@ Phase 9  부하 테스트 / 배포 준비  (300명 동시 접속 확인)
 **목표:** 클라이언트가 로비에 접속해서 `ENTER_LOBBY` → `LOBBY_ENTERED` 를 주고받는다.
 
 ### 3-1. 로비 룸 생성
-- [ ] 로비 채널 2개를 서로 다른 포트로 실행 (`lobby_1` = 6011, `lobby_2` = 6012)
-- [ ] 서버 기동 시 로비 룸을 **채널당 1개** 미리 만들어 둔다 (`autoDispose = false` — 사람이 0명이어도 방이 사라지지 않음)
-- [ ] 로비 최대 접속 300명 제한 — 넘으면 `CHANNEL_FULL` 에러 후 연결 종료 (`WITH_ERROR`)
+- [x] 로비 채널 2개를 서로 다른 포트로 실행 (`lobby_1` = 6011, `lobby_2` = 6012)
+- [x] 서버 기동 시 로비 룸을 **채널당 1개** 미리 만들어 둔다 (`autoDispose = false` — 사람이 0명이어도 방이 사라지지 않음)
+  - `matchMaker.createRoom()` 을 `server.listen()` **이후**에 호출해야 한다 (`matchMaker.accept()` 가 `listen()` 안에서 실행되므로, 그 전에 부르면 실패)
+- [x] 로비 최대 접속 300명 제한 — 넘으면 `CHANNEL_FULL` 에러 후 연결 종료 (`WITH_ERROR`)
   - 다른 로비 주소는 알려 주지 않는다. 클라이언트가 알아서 다른 로비로 다시 시도
+  - ⚠️ **버그 발견 및 수정:** 처음엔 `onJoin` 에서 바로 인원수를 검사해 에러+종료했는데, Colyseus 클라이언트가
+    `JOIN_ROOM` 핸드셰이크를 마치기 전(=`onJoin` 실행 시점)에는 서버가 보낸 메시지를 큐에만 쌓아 두고 실제
+    전송하지 않는다. `onJoin` 안에서 곧바로 `client.leave()` 를 부르면 그 큐가 플러시될 기회가 없어
+    `CHANNEL_FULL` 에러 내용이 클라이언트에 끝내 전달되지 않았다(연결 종료 코드만 받음). 그래서 인원 제한 검사를
+    **`ENTER_LOBBY` 처리 시점**으로 옮겼다 — 그때는 클라이언트가 이미 핸드셰이크를 마친 뒤라 안전하게 전달된다.
 
 ### 3-2. 입장 처리 (`LobbyManager.ts`, `LobbyRoom.ts`)
-- [ ] 접속 후 10초 안에 `ENTER_LOBBY` 가 안 오면 → `ENTER_TIMEOUT` 에러 후 연결 종료
-- [ ] `ENTER_LOBBY { partner, mid, gender, phone }` 처리 순서
+- [x] 접속 후 10초 안에 `ENTER_LOBBY` 가 안 오면 → `ENTER_TIMEOUT` 에러 후 연결 종료 (`this.clock.setTimeout` 사용)
+- [x] `ENTER_LOBBY { partner, mid, gender, phone }` 처리 순서
   1. payload 형식 검사 → 틀리면 `INVALID_REQUEST`
   2. partner / mid / gender / phone 형식 검사 → 틀리면 `INVALID_ID`
-     - ⚠️ phone 은 개인정보 — 에러 로그에도 값 그대로 남기지 않는다 (예: 뒷자리 마스킹)
-     - 1차 구현은 별도 인증 없음. 나중에 **토큰 검증을 이 자리에 끼워 넣을 수 있게** 검사 단계를 함수로 분리해 둔다
+     - ⚠️ phone 은 개인정보 — 에러 로그에도 값 그대로 남기지 않는다 (뒷자리 4자리만 남기고 마스킹, `MaskPhone()`)
+     - 1차 구현은 별도 인증 없음. `VerifyAuth()` 함수를 미리 분리해 둬서 나중에 토큰 검증만 채우면 되게 함
   3. userid 생성 → `userRepository` 로 유저 조회(없으면 생성) — 이 과정에서 Redis 에도 저장됨
   4. 같은 userid 가 이미 로비 대기 중이거나 게임 중 → `ALREADY_CONNECTED`
+     (지금은 **이 로비 룸 안에서만** 검사한다 — 다른 채널/게임 중 여부는 CLAUDE.md 흐름 12번대로 아직 막지 않음)
   5. 성공 → `LOBBY_ENTERED { user, is_new_user }` 전송, 대기 목록에 등록
-- [ ] 이미 입장한 연결이 `ENTER_LOBBY` 를 또 보내면 → `ALREADY_ENTERED` (연결은 유지)
-- [ ] 기존 유저의 phone 이 바뀌었으면 DB 갱신 → `SaveUserCache` 로 Redis 도 갱신 (write-through)
-- [ ] DB 오류 등 → `SERVER_ERROR` 후 연결 종료
-- [ ] 연결을 끊을 때는 **반드시 종료 코드**를 준다 (`WITH_ERROR` = 4002)
+- [x] 이미 입장한 연결이 `ENTER_LOBBY` 를 또 보내면 → `ALREADY_ENTERED` (연결은 유지)
+- [x] 기존 유저의 phone 이 바뀌었으면 DB 갱신 → `SaveUserCache` 로 Redis 도 갱신 (write-through) — Phase 2 의 `GetOrCreateUser` 가 이미 처리
+- [x] DB 오류 등 → `SERVER_ERROR` 후 연결 종료
+- [x] 연결을 끊을 때는 **반드시 종료 코드**를 준다 (`WITH_ERROR` = 4002)
 
 ### 3-3. 로비 퇴장
-- [ ] 대기 목록에서 제거
-- [ ] `TouchUserCache` 로 Redis TTL 만 다시 설정 (값은 이미 입장 때 저장되어 있음)
+- [x] 대기 목록에서 제거
+- [x] `TouchUserCache` 로 Redis TTL 만 다시 설정 (값은 이미 입장 때 저장되어 있음)
+  - 퇴장 시점에 Redis 에서 `CachedUserInfo` 를 다시 읽어(phone 포함) `TouchUserCache` 에 넘긴다 — 이미 만료됐으면
+    (드문 경우) 그냥 둔다. 다음 `ENTER_LOBBY` 때 DB 에서 다시 채워지므로 문제 없다
 
 **완료 확인**
-- [ ] 테스트 클라이언트(간단한 Node 스크립트)로 접속 → `LOBBY_ENTERED` 수신
-- [ ] 각 에러 코드(`INVALID_ID`, `ALREADY_CONNECTED`, `ENTER_TIMEOUT`, `CHANNEL_FULL` …)를 일부러 발생시켜 확인
-  - `CHANNEL_FULL` 은 테스트할 때만 최대 인원을 작게(예: 2명) 바꿔서 확인
-- [ ] 로비를 나갔다가 2분 안에 다시 들어오면 DB 조회 없이 Redis 에서 정보를 가져온다.
-- [ ] `CLAUDE.md` 의 ERROR 코드 표와 실제 동작이 일치한다.
+- [x] 테스트 클라이언트로 접속 → `LOBBY_ENTERED` 수신 (2026-09-22, 직접 만든 최소 프로토콜 클라이언트로 확인 — 아래 참고)
+- [x] 각 에러 코드(`INVALID_REQUEST`, `INVALID_ID`, `ALREADY_ENTERED`, `ALREADY_CONNECTED`, `ENTER_TIMEOUT`(실제 10초 대기), `CHANNEL_FULL`)를 일부러 발생시켜 확인
+  - `CHANNEL_FULL` 은 `MAX_CLIENTS_PER_CHANNEL` 을 2로 잠시 낮춰서 확인 후 300으로 복구
+- [x] 로비를 나갔다가 다시 들어오면 DB 조회 없이 Redis 에서 정보를 가져온다. (실제 `leave()` 후 재접속 + Redis TTL 값(119초)까지 확인)
+- [x] `CLAUDE.md` 의 ERROR 코드 표와 실제 동작이 일치한다. (`SERVER_ERROR` 는 코드 리뷰로만 확인 — DB 장애를 실제로 일으키진 않음)
+
+> ⚠️ **테스트 도구 관련 문제:** 공식 클라이언트 SDK `colyseus.js` 는 아직 0.16.x 까지만 배포되어 있어 서버(0.18)와
+> 매칭 응답 형식이 달라 호환되지 않았다 (`reservation.room.name` 을 기대하는데 0.18 서버는 `{name, sessionId, roomId, processId}`
+> 를 평평하게 반환). 서버 소스(`@colyseus/core` 의 `Protocol.mjs`, `Room.mjs`)를 참고해 ROOM_DATA 프레임만 다루는
+> 최소 테스트 클라이언트를 직접 작성해서 확인했다 (`--no-save` 로 설치해 `package.json` 에는 남기지 않음, 테스트 후 삭제).
+> 메시지 타입/내용은 `msgpackr` 의 `unpackMultiple()` 로 분리해서 읽으면 된다.
 
 > 💡 **종료 코드를 꼭 줘야 하는 이유:** 코드 없이 끊으면 Colyseus 클라이언트 SDK 는 "네트워크가 잠깐 끊겼나 보다" 하고 **자동 재접속**을 시도합니다. 서버가 의도적으로 내보낸 건데 계속 다시 들어오는 문제가 생깁니다.
+
+> 💡 **onJoin 안에서 메시지를 보낼 때 주의:** Colyseus 는 클라이언트가 `JOIN_ROOM` 핸드셰이크를 마치기 전까지 서버가 보낸
+> 메시지를 큐에 쌓아만 두고 전송하지 않습니다. `onJoin` 에서 검사 후 곧바로 연결을 끊어야 하는 로직이 있다면, 메시지가
+> 실제로 전달되는지 반드시 확인하세요. (이번 `CHANNEL_FULL` 버그가 정확히 이 문제였습니다 — `ENTER_LOBBY` 처리 시점처럼
+> 클라이언트가 이미 메시지를 보낼 수 있는 상태에서 검사하면 안전합니다.)
 
 ---
 

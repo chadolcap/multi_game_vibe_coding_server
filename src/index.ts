@@ -6,7 +6,7 @@
 import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
-import { Server } from "@colyseus/core";
+import { Server, matchMaker } from "@colyseus/core";
 import { WebSocketTransport } from "@colyseus/ws-transport";
 import { config } from "./common/config.js";
 import { GetChannelId, GetChannelPort, GetLobbyRoomName, type ChannelType } from "./common/channelNames.js";
@@ -58,7 +58,17 @@ async function Main(): Promise<void> {
         console.log(`[${channel_id}] Watcher 룸은 Phase 7 에서 등록합니다`);
     }
 
+    // matchMaker.accept() 가 listen() 안에서 실행되므로, 룸을 미리 만드는 작업은 listen() 이후에 한다
     await server.listen(port);
+
+    if (channel_type === "lobby") {
+        const lobby_room_name = GetLobbyRoomName(channel_no);
+        // 로비 룸은 사람이 없어도 사라지지 않아야 하므로(autoDispose=false), 매칭 요청을 기다리지 않고
+        // 서버 기동 시점에 바로 만들어 둔다.
+        await matchMaker.createRoom(lobby_room_name, {});
+        console.log(`[${channel_id}] ${lobby_room_name} 룸을 미리 생성했습니다`);
+    }
+
     const protocol = config.use_tls ? "wss" : "ws";
     console.log(`[${channel_id}] 서버 시작 ${protocol}://localhost:${port}`);
 }
