@@ -8,9 +8,12 @@ import http from "node:http";
 import https from "node:https";
 import { Server, matchMaker } from "@colyseus/core";
 import { WebSocketTransport } from "@colyseus/ws-transport";
+import { RedisPresence } from "@colyseus/redis-presence";
+import { RedisDriver } from "@colyseus/redis-driver";
 import { config } from "./common/config.js";
-import { GetChannelId, GetChannelPort, GetLobbyRoomName, type ChannelType } from "./common/channelNames.js";
+import { GetChannelId, GetChannelPort, GetGameRoomName, GetLobbyRoomName, type ChannelType } from "./common/channelNames.js";
 import { LobbyRoom } from "./game/lobby/LobbyRoom.js";
+import { GameRoom } from "./game/room/GameRoom.js";
 
 function ParseArgs(): { channel_type: ChannelType; channel_no: number } {
     const [type_arg, no_arg] = process.argv.slice(2);
@@ -44,15 +47,19 @@ async function Main(): Promise<void> {
     const port = GetChannelPort(channel_type, channel_no);
     const channel_id = GetChannelId(channel_type, channel_no);
 
+    // 로비 프로세스가 다른 프로세스(게임 채널)의 방에 좌석을 예약하려면, 모든 채널이
+    // 같은 Redis 를 통해 방 목록/좌석 예약 요청을 주고받아야 한다 (Presence = pub/sub, Driver = 방 목록 저장소).
+    const redis_options = { host: config.redis_host, port: config.redis_port };
     const server = new Server({
         transport: new WebSocketTransport({ server: CreateHttpServer() }),
+        presence: new RedisPresence(redis_options),
+        driver: new RedisDriver(redis_options),
     });
 
     if (channel_type === "lobby") {
         server.define(GetLobbyRoomName(channel_no), LobbyRoom);
     } else if (channel_type === "game") {
-        // Phase 4 에서 GameRoom 등록
-        console.log(`[${channel_id}] 게임 채널 룸은 Phase 4 에서 등록합니다`);
+        server.define(GetGameRoomName(channel_no), GameRoom);
     } else {
         // Phase 7 에서 Watcher 룸 등록
         console.log(`[${channel_id}] Watcher 룸은 Phase 7 에서 등록합니다`);

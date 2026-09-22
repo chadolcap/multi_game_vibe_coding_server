@@ -12,8 +12,8 @@ export const MessageType = {
     // 로비
     ENTER_LOBBY: "ENTER_LOBBY",           // C→S
     LOBBY_ENTERED: "LOBBY_ENTERED",       // S→C
-    JOIN_MATCH: "JOIN_MATCH",             // C→S (Phase 4 확정)
-    CANCEL_MATCH: "CANCEL_MATCH",         // C→S (Phase 4 확정)
+    JOIN_MATCH: "JOIN_MATCH",             // C→S — 게임 참여(매칭 대기열 등록). payload 없음
+    CANCEL_MATCH: "CANCEL_MATCH",         // C→S — 매칭 대기 취소. payload 없음
     MATCH_FOUND: "MATCH_FOUND",           // S→C
 
     // 게임방 (Phase 5 확정)
@@ -23,6 +23,7 @@ export const MessageType = {
     OPPONENT_CHOICE: "OPPONENT_CHOICE",   // S→C
     ROUND_RESULT: "ROUND_RESULT",         // S→C
     RETURN_TO_LOBBY: "RETURN_TO_LOBBY",   // S→C
+    OPPONENT_JOINED: "OPPONENT_JOINED",   // S→C — 기다리는 방에 새 상대 입장 (Phase 5 에서 실제로 사용)
 
     // 공통
     NOTICE: "NOTICE",                     // S→C (Phase 7)
@@ -67,4 +68,33 @@ export interface UserInfo {
     total_win_count: number;
     today_game_count: number;
     today_win_count: number;
+}
+
+// Colyseus matchMaker.reserveSeatFor() 가 돌려주는 값(ISeatReservation)의 우리 쪽 서브셋.
+// 클라이언트는 이 값으로 consumeSeatReservation() 해서 게임방에 들어간다. userid 등 유저 정보는 들어 있지 않다.
+export interface SeatReservation {
+    name: string;
+    sessionId: string;
+    roomId: string;
+    processId?: string;
+    reconnectionToken?: string;
+}
+
+// 상대방에게 공개해도 되는 최소 정보 (userid 는 개인정보라 보내지 않는다)
+export interface OpponentInfo {
+    name: string;
+    avatar: string;
+}
+
+// MATCH_FOUND 로 클라이언트에 보내는 값
+export interface MatchFoundPayload {
+    room_name: string;
+    room_id: string;
+    seat_reservation: SeatReservation;
+    opponent: OpponentInfo;
+}
+
+// 좌석 예약(auth data)에 담아 게임방으로 넘기는 값. phone 등 개인정보는 UserInfo 에 애초에 없으므로 그대로 재사용한다.
+export interface GameSeatAuth {
+    user: UserInfo;
 }

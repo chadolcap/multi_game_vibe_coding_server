@@ -34,6 +34,8 @@
   "homepage": "https://github.com/chadolcap/multi_game_vibe_coding_server#readme",
   "dependencies": {
     "@colyseus/core": "^0.18.15",
+    "@colyseus/redis-driver": "^0.18.2",
+    "@colyseus/redis-presence": "^0.18.4",
     "@colyseus/ws-transport": "^0.18.2",
     "express": "^5.2.1",
     "ioredis": "^6.0.0",

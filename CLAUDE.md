@@ -15,6 +15,8 @@
   - 모듈 형식: ESM (`"type": "module"`), TypeScript 7 (`esModuleInterop: true`), 상대 경로 import 는 `.js` 확장자로 쓴다
   - 실행: `npm run build` 후 `node dist/index.js <watcher|lobby|game> <채널 번호(1부터)>` (채널별 npm 스크립트 `start:lobby1` 등)
   - `npm run build` 는 `tsc` 뒤에 `scripts/copy-assets.mjs` 를 실행해 `.sql` 등 정적 파일을 `dist/` 로 복사한다 (tsc 가 컴파일하지 않으므로)
+  - Presence/Driver: `@colyseus/redis-presence` + `@colyseus/redis-driver` 0.18 — **모든 채널(로비/게임/Watcher)** 이 같은 Redis(포트 6780)
+    를 통해 방 목록/좌석 예약을 주고받는다. 로비 프로세스가 다른 프로세스(게임 채널)의 방에 좌석을 예약할 수 있는 것도 이 덕분이다
 - DB: MySQL — 드라이버 `mysql2` (개발 PC: XAMPP 의 MariaDB 10.4, MySQL 호환. root 계정 비밀번호 없음)
 - Cache / 세션 저장: Redis(port 6780) — 클라이언트 `ioredis`
   - `import { Redis } from "ioredis"` **named import** 로 쓴다. 기본 import(`import Redis from "ioredis"`)는 ioredis(CJS) + TypeScript 7 + `module: nodenext` 조합에서 타입 에러가 난다.
@@ -60,12 +62,16 @@ src/
   game/
     lobby/
       LobbyManager.ts       # ENTER_LOBBY 처리(형식 검사 → userRepository 조회/등록 → 대기 목록), ALREADY_CONNECTED/ALREADY_ENTERED 판단.
-                             게임 참여를 선택하면 게임 채널의 참여 가능한 방정보를 클라이언트에 전달 한다 (Phase 4)
+                             JOIN_MATCH 대기열(match_queue) 관리, RoomManager 를 불러 매칭 성사 시 MATCH_FOUND 전송
       LobbyRoom.ts          # 소켓 이벤트(onJoin/onMessage/onLeave)를 받아 LobbyManager 에 위임. ENTER_TIMEOUT 타이머, CHANNEL_FULL 인원 검사.
                              나중에 로비에서 이뤄지는 구매, 광고 보기 등의 컨텐츠 처리도 여기 추가
     room/
-      RoomManager.ts        # 로비에서 온 유저를 room 에 입장 시키기, GameRoom 을 감시하여 참여자를 입장 시키는 역활
+      RoomManager.ts        # (로비 프로세스 안에서 동작) 채널 선택 + matchMaker.createRoom/reserveSeatFor 로 2명을 게임방에 입장시킨다.
+                             "기다리는 방"이 있으면 그쪽을 먼저 채운다
       GameRoom.ts	        # 실제 게임룰이 진행 되는 모듈. 종료 시 Lobby로 복귀(2인이 게임을 하는 로직이 실행 됨. 게임방이 100개라면 GameRoom 클래스가 100개 생성 되는 방식)
+                             Phase 4 시점: 잠금(lock) + 좌석 예약 유저 정보 저장 + 10초 안에 2명 안 모이면 정리, 까지만 구현됨
+      waitingRooms.ts       # "기다리는 방" 목록 (Redis LIST, RPUSH/LPOP 원자적). PushWaitingRoom/PopWaitingRoom/RemoveWaitingRoom
+      types.ts              # WaitingRoomEntry 타입 (channel_no, room_name, room_id, opponent)
   db/
     connection.ts           # MySQL connection pool 관리 (mysql2/promise)
     redis.ts                # Redis 클라이언트 관리 + JSON 저장/조회/삭제 헬퍼, 채널간 공유 정보 저장 (ioredis)
@@ -230,9 +236,10 @@ Colyseus 메시지 이름 = `type`, 메시지 본문 = envelope.
 |---|---|---|---|
 | ENTER_LOBBY | C→S | `{ partner, mid, gender, phone }` | 로비 진입 요청 (gender: F/M, phone: 필수 — 기존 유저는 phone 갱신) |
 | LOBBY_ENTERED | S→C | `{ user: UserInfo, is_new_user }` | 유저 게임 정보 전달 (본인 정보라 userid 포함) |
-| JOIN_MATCH | C→S | (Phase 4 확정) | "게임 참여" — 매칭 대기열 등록 |
-| CANCEL_MATCH | C→S | (Phase 4 확정) | 매칭 대기 취소 — 대기열에서 빼고 로비에 남음. 이미 매칭된 뒤 도착하면 무시 |
+| JOIN_MATCH | C→S | `{}` (없음) | "게임 참여" — 매칭 대기열 등록 |
+| CANCEL_MATCH | C→S | `{}` (없음) | 매칭 대기 취소 — 대기열에서 빼고 로비에 남음. 이미 매칭된 뒤 도착하면 무시 |
 | MATCH_FOUND | S→C | `{ room_name, room_id, seat_reservation, opponent: { name, avatar } }` | 매칭 완료. 상대 userid 는 보내지 않는다 |
+| OPPONENT_JOINED | S→C | `{ name, avatar }` | "기다리는 방"에 새 상대가 들어왔을 때 (Phase 5 에서 실제로 쓰임) |
 | ROOM_ENTER_ACK | C→S | (Phase 5 확정) | 게임방 입장 완료 신호 |
 | GAME_START | S→C | (Phase 5 확정) | 양쪽 입장 완료 확인 후 게임 시작 신호 |
 | SUBMIT_CHOICE | C→S | (Phase 5 확정) | 가위/바위/보 선택 제출 |

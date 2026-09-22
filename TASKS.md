@@ -274,53 +274,75 @@ Phase 9  부하 테스트 / 배포 준비  (300명 동시 접속 확인)
 **목표:** 로비에서 "게임 참여" → 게임 채널의 방 좌석을 예약(유저 정보 포함) → 클라이언트가 로비를 떠나 게임방으로 이동한다.
 
 ### 4-1. 게임 채널 준비
-- [ ] 게임 채널 3개를 서로 다른 포트로 실행 (`game_1` = 6021, `game_2` = 6022, `game_3` = 6023)
-- [ ] 게임방은 **잠금 상태**로 만든다 → 이름/roomId 로 직접 못 들어오고, 예약된 좌석으로만 입장
-- [ ] 채널당 방 최대 100개 / 인원 200명 제한
+- [x] 게임 채널 3개를 서로 다른 포트로 실행 (`game_1` = 6021, `game_2` = 6022, `game_3` = 6023)
+- [x] 게임방은 **잠금 상태**로 만든다 → 이름/roomId 로 직접 못 들어오고, 예약된 좌석으로만 입장
+  (`GameRoom.onCreate()` 에서 `this.lock()`. `reserveSeatFor()` 는 잠금과 상관없이 동작 — 서버 소스로 확인)
+- [x] 채널당 방 최대 100개 / 인원 200명 제한
+  (방마다 정확히 2명이므로 "방 100개 제한"만 지키면 인원 200명도 자동으로 지켜진다 — 따로 인원을 셀 필요 없음)
 
 ### 4-2. 채널 간 정보 공유 (중요!)
-- [ ] 여러 프로세스가 하나의 Colyseus 처럼 동작하도록 **Redis 기반 Presence / Driver** 설정
+- [x] 여러 프로세스가 하나의 Colyseus 처럼 동작하도록 **Redis 기반 Presence / Driver** 설정
+  (`@colyseus/redis-presence` + `@colyseus/redis-driver` 0.18, `src/index.ts` 에서 **모든 채널**에 동일하게 적용)
   - 로비 프로세스가 **다른 프로세스(게임 채널)의 방**에 좌석을 예약하려면 반드시 필요합니다.
   - 좌석 예약에 담은 유저 정보도 이 경로(Redis pub/sub)를 통해 게임방 프로세스로 전달됩니다.
-- [ ] 각 채널의 현재 인원/방 개수를 Redis 에 기록 (채널 선택과 Watcher 에서 사용)
+- [x] ~~각 채널의 현재 인원/방 개수를 Redis 에 기록~~ → **결정: 별도로 기록하지 않는다.**
+  `matchMaker.query({ name: room_name })` 자체가 이미 같은 Redis(RedisDriver)를 실시간으로 읽으므로,
+  채널 선택(방 개수 확인)에는 이 조회를 그대로 쓴다. Watcher(Phase 7)용 표시 데이터가 따로 필요해지면
+  그때 별도의 통계 저장을 추가한다 (지금 만들면 쓰이지 않는 코드가 된다).
 
 ### 4-3. 매칭 (`LobbyManager.ts` → `RoomManager.ts`)
-- [ ] "게임 참여"(`JOIN_MATCH`) 요청을 받으면 대기열에 넣기
-- [ ] **매칭 대기 취소**(`CANCEL_MATCH`) — 대기열에서 빼고 로비에 그대로 남긴다
-  - 이미 매칭되어 좌석 예약이 진행된 뒤 도착한 취소는 무시 (매칭과 취소가 동시에 일어나는 경우 주의)
+- [x] "게임 참여"(`JOIN_MATCH`) 요청을 받으면 대기열에 넣기 (로비 룸 안의 `match_queue: string[]`, userid 순서대로)
+- [x] **매칭 대기 취소**(`CANCEL_MATCH`) — 대기열에서 빼고 로비에 그대로 남긴다
+  - 이미 매칭되어 좌석 예약이 진행된 뒤 도착한 취소는 무시 (매칭 시작 시점에 대기열에서 바로 빼므로,
+    그 뒤에 오는 취소는 "대기열에 없음" 분기로 자연스럽게 무시된다 — 별도 플래그 불필요)
   - 대기열에 없는 유저가 보내도 에러 없이 무시
-- [ ] `JOIN_MATCH` / `CANCEL_MATCH` payload 확정 → `CLAUDE.md` 메시지 표 반영
-- [ ] 매칭할 방을 고르는 순서
+- [x] `JOIN_MATCH` / `CANCEL_MATCH` payload 확정 → `CLAUDE.md` 메시지 표 반영 (**payload 없음**, 둘 다 `{}`)
+- [x] 매칭할 방을 고르는 순서
   1. **상대를 기다리는 방**(재게임을 신청하고 혼자 남은 유저가 있는 방, Phase 5-4)이 있으면 → 로비 유저 **1명**을 그 방에 넣는다
   2. 없으면 로비 대기열에서 **2명**이 모일 때 새 방을 만든다
-  - "기다리는 방" 목록은 Redis 에 기록해 로비 프로세스가 볼 수 있게 한다 (게임방 프로세스가 등록/삭제)
-- [ ] 게임 채널 선택 규칙: **1번 채널부터 채우고, 꽉 차면 다음 채널** 로
-- [ ] 게임 채널 3개가 **모두 찼으면** → `NO_GAME_ROOM` 에러 전송, 유저는 로비에 그대로 남는다 (연결 유지)
+  - "기다리는 방" 목록은 Redis LIST(`waiting_rooms`) 에 기록 — `RPUSH`(등록)/`LPOP`(꺼내기) 은 각각 원자적이라
+    로비 채널 2개가 동시에 같은 방을 가져가는 경합이 없다. 구현: `src/game/room/waitingRooms.ts`
+    (`PushWaitingRoom`/`RemoveWaitingRoom` 은 Phase 5 의 GameRoom 이 호출할 준비만 해 둠 — 지금은 아무도 등록 안 해서 이 경로는 항상 "없음")
+- [x] 게임 채널 선택 규칙: **1번 채널부터 채우고, 꽉 차면 다음 채널** 로
+  (`matchMaker.query({name: room_name}).length >= MAX_ROOMS_PER_GAME_CHANNEL` 이면 다음 채널 — 방 100개 제한이 곧 인원 200명 제한)
+- [x] 게임 채널 3개가 **모두 찼으면** → `NO_GAME_ROOM` 에러 전송, 유저는 로비에 그대로 남는다 (연결 유지)
   - message: "접속 가능한 게임방이 없습니다. 잠시 후 다시 참여 해 주세요."
-- [ ] `RoomManager` 가 게임방 생성(또는 기다리는 방 찾기)
-- [ ] 좌석을 예약하면서 **유저 정보를 함께 담는다**
-  - `matchMaker.reserveSeatFor(room, options, { user: ToGameUser(info) })`
-  - 3번째 인자를 지원하지 않는 버전이면 2번째 인자(options)에 담는다 — 서버가 넣는 값이라 안전
-  - `ToGameUser()` 로 게임에 필요한 값만 추린다 (userid, name, avatar 등). **phone 같은 개인정보는 넣지 않는다.**
-- [ ] `MATCH_FOUND { room_name, room_id, seat_reservation, opponent: { name, avatar } }` 전송
-  - ⚠️ 상대방 userid 는 보내지 않는다 (개인정보)
-- [ ] 로비 연결 종료 — 종료 코드 `CONSENTED`(4000)
+  - 재큐잉은 하지 않는다 — 클라이언트가 원하면 `JOIN_MATCH` 를 다시 보내야 한다
+- [x] `RoomManager` 가 게임방 생성(또는 기다리는 방 찾기) — `src/game/room/RoomManager.ts`
+- [x] 좌석을 예약하면서 **유저 정보를 함께 담는다**
+  - `matchMaker.reserveSeatFor(room, options, { user })` — 0.18 은 3번째 인자를 지원한다 (확인 완료)
+  - `UserInfo` 를 그대로 쓴다(phone 이 처음부터 없어서 별도 `ToGameUser()` 변환이 필요 없었음). 상대에게 보이는
+    `opponent` 정보만 `ToPublicOpponentInfo()` 로 `{ name, avatar }` 로 한 번 더 줄인다
+- [x] `MATCH_FOUND { room_name, room_id, seat_reservation, opponent: { name, avatar } }` 전송
+  - ⚠️ 상대방 userid 는 보내지 않는다 (개인정보) — `seat_reservation`/`opponent` 어디에도 없음, 테스트로 확인
+- [x] 로비 연결 종료 — 종료 코드 `CONSENTED`(4000)
 
 ### 4-4. 클라이언트 이동 / 게임방 입장
-- [ ] 클라이언트는 10초 안에 받은 좌석 예약으로 게임방 입장
-- [ ] `GameRoom.onJoin(client, options, auth)` 에서 `auth.user` 를 바로 꺼내 플레이어 목록에 저장 (Redis/DB 조회 없음)
-- [ ] 10초 안에 안 오면 좌석 만료 → 새로 만든 방이면 먼저 들어온 한 명은 `RETURN_TO_LOBBY` 로 로비 복귀
-  - 기다리는 방에 들어오기로 한 유저가 안 온 경우에는 기다리던 유저를 로비로 보내지 않고 **다시 "기다리는 방"으로 등록**
-- [ ] 기다리던 유저에게 새 상대가 들어왔음을 알린다 (예: `OPPONENT_JOINED { name, avatar }` — 상대 userid 는 보내지 않음)
+- [x] 클라이언트는 10초 안에 받은 좌석 예약으로 게임방 입장 (`SEAT_RESERVATION_SEC` 상수, `GameRoom` 자체 타이머로 확인)
+- [x] `GameRoom.onJoin(client, options, auth)` 에서 `auth.user` 를 바로 꺼내 플레이어 목록에 저장 (Redis/DB 조회 없음 — 코드에 해당 모듈 import 자체가 없음)
+- [x] 10초 안에 안 오면 좌석 만료 → 새로 만든 방이면 먼저 들어온 한 명은 `RETURN_TO_LOBBY` 로 로비 복귀
+  - 기다리는 방에 들어오기로 한 유저가 안 온 경우의 "다시 기다리는 방으로 등록"은 **Phase 5 로 미룸**
+    (그 경로 자체가 Phase 5 의 재게임 기능이 있어야 발생하므로 지금은 실제로 탈 일이 없다)
+- [ ] 기다리던 유저에게 새 상대가 들어왔음을 알린다 (`OPPONENT_JOINED { name, avatar }`) → **Phase 5 로 미룸** (같은 이유)
 
 **완료 확인**
-- [ ] 테스트 클라이언트 2개로: 로비 접속 → 게임 참여 → `MATCH_FOUND` → 게임방 입장까지 성공
-- [ ] 기다리는 방이 있으면 로비 유저 1명이 새 방이 아니라 그 방으로 들어간다.
-- [ ] 게임방 입장 시 Redis/DB 조회가 일어나지 않는다. (로그로 확인)
-- [ ] 클라이언트가 받은 `seat_reservation` 안에 유저 정보가 들어 있지 않다. (sessionId, 방 정보만 있음)
-- [ ] 테스트 클라이언트 여러 개로 1번 채널이 먼저 차는지 확인
+- [x] 테스트 클라이언트 2개로: 로비 접속 → 게임 참여 → `MATCH_FOUND` → 게임방 입장까지 성공 (2026-09-22)
+- [ ] ~~기다리는 방이 있으면 로비 유저 1명이 새 방이 아니라 그 방으로 들어간다.~~ → Phase 5 전까지는 기다리는 방이 생길 수 없어 테스트 불가 (Push 하는 코드가 없음). Phase 5 에서 함께 확인
+- [x] 게임방 입장 시 Redis/DB 조회가 일어나지 않는다. (`GameRoom.ts` 에 db/redis import 자체가 없음 — 코드로 보장)
+- [x] 클라이언트가 받은 `seat_reservation` 안에 유저 정보가 들어 있지 않다. (`{name, sessionId, roomId, processId}` 뿐 — 테스트로 확인)
+- [x] 테스트 클라이언트 여러 개로 1번 채널이 먼저 차는지 확인
+  (`MAX_ROOMS_PER_GAME_CHANNEL=1` 로 잠시 낮추고 `game_2`/`game_3` 프로세스는 끈 채로 확인: 1번째 쌍은 `game_1` 로,
+  2번째 쌍은 1번 채널이 꽉 차 2·3번 채널을 시도하지만 그 프로세스들이 없어 결국 `NO_GAME_ROOM` — 둘 다 예상대로 동작)
 
 > 💡 **좌석 예약에 담은 정보는 왜 조작할 수 없나요?** 클라이언트가 받는 `seat_reservation` 은 "입장권 번호(sessionId)"와 방 주소뿐입니다. 유저 정보는 게임방 프로세스 메모리에 이미 있고, 클라이언트가 입장권을 내밀면 서버가 번호로 찾아서 꺼내 줍니다.
+
+> ⚠️ **테스트 시 알아 둘 점 (다음 Phase 에서도 재사용 가능)**
+> - 공식 클라이언트 SDK(`colyseus.js`)가 아직 0.18 과 호환되지 않아, Phase 3 에서 만든 최소 프로토콜 클라이언트를
+>   확장해서(`ConsumeSeatReservation()` 추가) 좌석 예약을 직접 소비하는 것까지 테스트했다.
+> - 채널 오버플로우/`NO_GAME_ROOM` 은 `MAX_ROOMS_PER_GAME_CHANNEL` 을 1로 낮추고, 일부러 `game_2`/`game_3`
+>   프로세스를 켜지 않은 채로 확인했다 (100개 방을 실제로 만들어 채우는 건 비현실적이므로).
+>   `matchMaker.createRoom()` 이 등록된 프로세스가 없는 채널 이름으로 호출되면 적당한 시간 안에 실패하고,
+>   `RoomManager` 가 다음 채널로 넘어가다가 결국 `NO_GAME_ROOM` 을 반환하는 것까지 확인했다.
 
 ---
 

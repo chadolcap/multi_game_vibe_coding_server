@@ -36,6 +36,14 @@ export class LobbyRoom extends Room {
                 this.ClearEnterTimeout(client.sessionId);
             }
         });
+
+        this.onMessage(MessageType.JOIN_MATCH, async (client) => {
+            await this.manager.HandleJoinMatch(client);
+        });
+
+        this.onMessage(MessageType.CANCEL_MATCH, (client) => {
+            this.manager.HandleCancelMatch(client);
+        });
     }
 
     onJoin(client: Client): void {
