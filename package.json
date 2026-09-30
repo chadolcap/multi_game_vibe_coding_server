@@ -14,7 +14,7 @@
     "start:game1": "node dist/index.js game 1",
     "start:game2": "node dist/index.js game 2",
     "start:game3": "node dist/index.js game 3",
-    "redis": "\"C:\\Program Files\\Redis\\redis-server.exe\" redis/redis-6780.conf",
+    "redis": "node scripts/run-redis.mjs",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {

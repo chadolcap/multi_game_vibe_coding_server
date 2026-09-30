@@ -11,3 +11,12 @@ export interface WaitingRoomEntry {
     room_id: string;
     opponent: OpponentInfo;
 }
+
+// "게임 중인 userid → 게임방" 기록 (Phase 6-1, activeGame.ts). F5 새로고침 등으로 로비를 통해 다시
+// 접속했을 때, 로비가 이 기록으로 matchMaker.reconnect() 를 불러 원래 게임방으로 돌려보내는 데 쓴다.
+// reconnection_token 은 GameRoom.onJoin/onReconnect 때마다(재접속할 때마다 새로 발급되므로) 다시 저장한다.
+export interface ActiveGameEntry {
+    room_name: string;
+    room_id: string;
+    reconnection_token: string;
+}

@@ -50,6 +50,11 @@ export const config = {
     lobby_ports: ReadNumberList("LOBBY_PORTS", [6011, 6012]),
     game_ports: ReadNumberList("GAME_PORTS", [6021, 6022, 6023]),
 
+    // 좌석 예약(seat_reservation)의 publicAddress 에 쓰는 이 서버의 공개 주소.
+    // 개발 환경 기본값은 localhost. 운영 환경은 실제 도메인/IP 로 .env 에 설정해야 한다.
+    // (CLAUDE.md "게임 채널 접속 방식" 참고 — 나중에 ip/port 명시 방식으로 바뀌면 이 값의 용도도 바뀐다)
+    public_host: ReadString("PUBLIC_HOST", "localhost"),
+
     // wss(TLS) — 운영 환경은 반드시 true. 개발 환경에서만 false(ws) 로 켠다
     use_tls: ReadBoolean("USE_TLS", false),
     tls_cert_path: ReadString("TLS_CERT_PATH", ""),
@@ -65,4 +70,9 @@ export const config = {
     db_user: ReadString("DB_USER", ""),
     db_password: ReadString("DB_PASSWORD", ""),
     db_name: ReadString("DB_NAME", ""),
+
+    // 관리자(Watcher) 로그인 계정 — 코드/문서에 적지 않고 .env 로만 관리한다. 기본값을 두지 않는다
+    // (비어 있으면 어떤 비밀번호로도 로그인이 되는 사고를 막기 위해, WatcherManager 가 빈 값이면 기동을 거부한다).
+    admin_id: ReadString("ADMIN_ID", ""),
+    admin_password: ReadString("ADMIN_PASSWORD", ""),
 } as const;

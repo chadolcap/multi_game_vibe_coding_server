@@ -4,7 +4,14 @@
 //   (예: 'u'(117) ^ 5 = 112 → "112")
 // - 단방향 변환이다. userid 로 mid 를 복원할 수 없다. (mid 가 필요하면 user_partner_info 에서 조회)
 
-import { ALLOWED_GENDERS, MID_MAX_LENGTH, PARTNER_MAX_LENGTH, PHONE_MAX_LENGTH, USERID_XOR_KEY } from "./constants.js";
+import {
+    ALLOWED_GENDERS,
+    DEFAULT_AVATAR_BY_GENDER,
+    MID_MAX_LENGTH,
+    PARTNER_MAX_LENGTH,
+    PHONE_MAX_LENGTH,
+    USERID_XOR_KEY,
+} from "./constants.js";
 
 // partner: 영문/숫자 1~11자, '_' 포함 금지
 const PARTNER_PATTERN = /^[A-Za-z0-9]{1,11}$/;
@@ -27,6 +34,12 @@ export function IsValidGender(gender: unknown): gender is (typeof ALLOWED_GENDER
 // phone: 빈 값 불가, 텍스트 최대 100자 (형식은 자유 — 파트너사마다 다를 수 있어 숫자만으로 제한하지 않는다)
 export function IsValidPhone(phone: unknown): phone is string {
     return typeof phone === "string" && phone.length > 0 && phone.length <= PHONE_MAX_LENGTH;
+}
+
+// 첫 접속 유저의 기본 아바타 (M → a_m_0, F → a_f_0).
+// 호출 전에 IsValidGender 로 형식을 검사해야 한다. 검사되지 않은 값이 들어오면 빈 문자열을 돌려준다.
+export function GetDefaultAvatar(gender: string): string {
+    return DEFAULT_AVATAR_BY_GENDER[gender as (typeof ALLOWED_GENDERS)[number]] ?? "";
 }
 
 // mid 의 각 글자를 XOR 후 10진수 문자열로 이어 붙인다

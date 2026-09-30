@@ -1,11 +1,11 @@
 // 유저 정보 조회 진입점 (Redis → DB 순). 매니저(Lobby/Room/Watcher)는 이 모듈만 호출한다.
 // (CLAUDE.md "유저 정보 처리 단계" 1~5 구현)
 
-import { ConvertMidToUserid } from "../common/userid.js";
+import { ConvertMidToUserid, GetDefaultAvatar } from "../common/userid.js";
 import type { EnterLobbyPayload, UserInfo } from "../common/types.js";
 import { GetDbPool } from "./connection.js";
 import { FetchUserInfo } from "./queries/userInfo.js";
-import { RegisterNewUser, UpdatePhoneIfChanged } from "./queries/userRegistration.js";
+import { RegisterNewUser, TrySetUserName, UpdatePhoneIfChanged, type SetNameDbResult } from "./queries/userRegistration.js";
 import { GetUserCache, SaveUserCache } from "./userCache.js";
 import { ToPublicUserInfo, type CachedUserInfo } from "./types.js";
 
@@ -38,7 +38,7 @@ export async function GetOrCreateUser(input: EnterLobbyPayload): Promise<GetOrCr
             user = {
                 userid,
                 name: "",
-                avatar: "",
+                avatar: GetDefaultAvatar(input.gender),
                 gender: input.gender,
                 phone: input.phone,
                 total_game_count: 0,
@@ -62,4 +62,24 @@ export async function GetOrCreateUser(input: EnterLobbyPayload): Promise<GetOrCr
     await SaveUserCache(user);
 
     return { user: ToPublicUserInfo(user), is_new_user };
+}
+
+export type SetNameResult = "ok" | "duplicate";
+
+// NAME 등록 — 별명이 아직 없는 유저만 한 번 등록할 수 있다 (DB 의 UNIQUE 제약이 최종 방어선).
+// 성공하면 Redis 캐시에도 반영한다 (write-through). 호출 전에 name 형식/금칙어 검사는 끝나 있어야 한다.
+export async function SetUserName(userid: string, name: string): Promise<SetNameResult> {
+    const pool = GetDbPool();
+    const db_result: SetNameDbResult = await TrySetUserName(pool, userid, name);
+    if (db_result === "duplicate") return "duplicate";
+
+    // 캐시에 없으면(TTL 만료 등) DB 에서 다시 읽어 채운 뒤 저장한다
+    let cached = await GetUserCache(userid);
+    if (!cached) {
+        cached = await FetchUserInfo(pool, userid);
+    }
+    if (cached) {
+        await SaveUserCache({ ...cached, name });
+    }
+    return "ok";
 }

@@ -15,9 +15,12 @@ CREATE TABLE IF NOT EXISTS user_partner_info (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 유저의 기본 정보 (닉네임, 인증 등)
+-- name 은 NULL = "아직 등록 안 함" 이다. UNIQUE 제약이 있어 빈 문자열('')로 두면 신규 유저끼리
+-- 충돌하므로 NULL 을 쓴다 (MySQL/MariaDB 의 UNIQUE 인덱스는 NULL 을 여러 개 허용한다).
+-- 앱 코드(db/queries/userInfo.ts)에서는 NULL 을 빈 문자열로 바꿔서 다룬다.
 CREATE TABLE IF NOT EXISTS user_member_info (
     userid              VARCHAR(255) NOT NULL,
-    name                VARCHAR(50)  NOT NULL DEFAULT '',   -- 새 유저는 빈 값
+    name                VARCHAR(50)  NULL DEFAULT NULL,
     avatar              VARCHAR(255) NOT NULL DEFAULT '',   -- 새 유저는 빈 값
     phone               VARCHAR(100) NOT NULL,
     join_date           DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -25,6 +28,7 @@ CREATE TABLE IF NOT EXISTS user_member_info (
     certification_date  DATETIME     NULL,
     terms_date          DATETIME     NULL,
     PRIMARY KEY (userid),
+    UNIQUE KEY uq_member_name (name),
     CONSTRAINT fk_member_userid FOREIGN KEY (userid) REFERENCES user_partner_info (userid)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -35,7 +39,11 @@ CREATE TABLE IF NOT EXISTS user_play_info (
     total_win_count    INT UNSIGNED     NOT NULL DEFAULT 0,
     today_game_count   INT UNSIGNED     NOT NULL DEFAULT 0,
     today_win_count    INT UNSIGNED     NOT NULL DEFAULT 0,
-    today_date         DATE             NOT NULL,           -- today_* 가 어느 날짜 기준인지 (Phase 8: 날짜가 바뀌면 0 으로)
+    today_date         DATE             NOT NULL,           -- today_* 가 어느 날짜 기준인지. 오늘과 다르면
+                                                              -- 조회 시(queries/userInfo.ts) 0 으로 보정해서
+                                                              -- 보여주고, 다음 게임 결과 반영 시(queries/
+                                                              -- gameResult.ts UpdatePlayInfoAfterGame) 실제로
+                                                              -- 리셋된다 (Phase 8, "지연 초기화")
     PRIMARY KEY (userid),
     CONSTRAINT fk_play_userid FOREIGN KEY (userid) REFERENCES user_partner_info (userid)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -45,6 +53,7 @@ CREATE TABLE IF NOT EXISTS rank_daily (
     date_game  DATE         NOT NULL,
     userid     VARCHAR(255) NOT NULL,
     score      INT          NOT NULL DEFAULT 0,
+    updated_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (date_game, userid),
     KEY idx_rank_daily_score (date_game, score)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -54,6 +63,7 @@ CREATE TABLE IF NOT EXISTS rank_weekly (
     date_start DATE         NOT NULL,
     userid     VARCHAR(255) NOT NULL,
     score      INT          NOT NULL DEFAULT 0,
+    updated_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (date_start, userid),
     KEY idx_rank_weekly_score (date_start, score)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

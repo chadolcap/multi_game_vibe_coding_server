@@ -1,27 +1,147 @@
 // 실제 게임룰이 진행되는 모듈 (2인이 게임을 하는 로직 — 가위바위보 규칙 자체는 Phase 5 에서 구현).
 // Phase 4 에서는 "좌석 예약으로만 입장 가능한 잠긴 방"과 "10초 안에 2명이 안 모이면 정리" 만 다룬다.
 
-import { Room, CloseCode, type Client } from "@colyseus/core";
-import { PLAYERS_PER_ROOM, SEAT_RESERVATION_SEC } from "../../common/constants.js";
+import { Room, CloseCode, type Client, type Deferred, type Delayed } from "@colyseus/core";
+import { ParseGameChannelNo } from "../../common/channelNames.js";
+import {
+    CHOICE_TIMEOUT_SEC,
+    GAME_START_DELAY_SEC,
+    ONE_RESULT_DELAY_SEC,
+    PLAYERS_PER_ROOM,
+    RECONNECT_WAIT_SEC,
+    REMATCH_CHOICE_TIMEOUT_SEC,
+    SEAT_RESERVATION_SEC,
+    WIN_COUNT_TO_FINISH,
+} from "../../common/constants.js";
+import { LogConnect, LogDisconnect, RegisterLoggedMessage } from "../../common/log.js";
 import { SendMessage } from "../../common/messages.js";
-import { MessageType, type GameSeatAuth, type UserInfo } from "../../common/types.js";
+import {
+    MessageType,
+    type AdminChannelUserEntry,
+    type Choice,
+    type EnterRoomPayload,
+    type GameResultPayload,
+    type GameSeatAuth,
+    type OneRemainTimePayload,
+    type OneResultPayload,
+    type OneStartPayload,
+    type OpponentJoinedPayload,
+    type OutUserPayload,
+    type ReadyPayload,
+    type ReplayPayload,
+    type RoomPlayerInfo,
+    type SelectGamePayload,
+    type UserInfo,
+} from "../../common/types.js";
+import { RegisterRoom, UnregisterRoom } from "../../common/roomRegistry.js";
+import { SaveGameResult, type PlayRecord } from "../../db/gameResultRepository.js";
+import { RemoveActiveGame, SaveActiveGame } from "./activeGame.js";
+import { PushWaitingRoom, RemoveWaitingRoom } from "./waitingRooms.js";
+import type { ActiveGameEntry, WaitingRoomEntry } from "./types.js";
+
+// total_win_count / total_game_count 기준 승률 (0~100 정수). 한 판도 안 한 유저는 0.
+function ComputeWinPer(user: UserInfo): number {
+    if (user.total_game_count === 0) return 0;
+    return Math.round((user.total_win_count / user.total_game_count) * 100);
+}
+
+function ToRoomPlayerInfo(user: UserInfo): RoomPlayerInfo {
+    return { userid: user.userid, name: user.name, avatar: user.avatar, win_per: ComputeWinPer(user) };
+}
+
+// a 가 b 를 이기면 true (가위>보, 바위>가위, 보>바위)
+const BEATS: Record<Choice, Choice> = { 가위: "보", 바위: "가위", 보: "바위" };
+const ALL_CHOICES: Choice[] = ["가위", "바위", "보"];
+
+function PickRandomChoice(): Choice {
+    return ALL_CHOICES[Math.floor(Math.random() * ALL_CHOICES.length)];
+}
+
+// a 가 이기면 1, b 가 이기면 -1, 무승부면 0
+function JudgeChoice(a: Choice, b: Choice): number {
+    if (a === b) return 0;
+    return BEATS[a] === b ? 1 : -1;
+}
 
 export class GameRoom extends Room {
     maxClients = PLAYERS_PER_ROOM;
 
-    // sessionId → 좌석 예약에 담겨 온 유저 정보 (Redis/DB 조회 없이 바로 사용)
+    // sessionId → 좌석 예약에 담겨 온 유저 정보 (Redis/DB 조회 없이 바로 사용).
+    // Map 은 입력 순서를 유지하므로, ENTER_ROOM 의 player1/player2 순서(먼저 입장한 쪽이 player1)를
+    // 그대로 이 순서에서 가져온다.
     private readonly players = new Map<string, UserInfo>();
+    // ENTER_ROOM 을 보낸(로딩 등 준비가 끝난) sessionId 목록. 둘 다 모이면 그때 ENTER_ROOM 응답을 보낸다.
+    private readonly entered_by_session = new Set<string>();
+    private enter_room_sent = false;
+    // sessionId → READY 로 보낸 마지막 값. 둘 다 true 가 되는 순간 GAME_START 를 보낸다.
+    private readonly ready_by_session = new Map<string, boolean>();
+    private game_started = false;
 
-    onCreate(): void {
+    // sessionId → 이긴 판 수 (무승부는 세지 않는다). 둘 중 하나가 WIN_COUNT_TO_FINISH 에 도달하면 게임 종료.
+    private readonly win_count_by_session = new Map<string, number>();
+    // sessionId → 이번 판에 낸 값. 다음 판 시작(SendOneStart)마다 비운다.
+    private readonly choice_by_session = new Map<string, Choice>();
+    private round_active = false;
+    // ONE_START 뒤 1초마다 ONE_REMAIN_TIME 을 보내는 타이머. count 가 0 이 되면 자동으로 ResolveRound() 를 부른다.
+    private remain_time_interval: Delayed | null = null;
+    private game_over = false;
+    // 이번 게임(2선승제 한 판)이 시작된 시각과, 지금까지 낸 판 기록 — game_log 저장(Phase 5-3)에 쓴다.
+    // StartGame() 마다(최초 시작이든 같은 상대와의 재게임이든) 새로 초기화한다.
+    private game_started_at: Date | null = null;
+    private readonly plays: PlayRecord[] = [];
+
+    // sessionId → GAME_RESULT{replay:"Y"|"N"} 응답. true=재게임, false=나가기. REMATCH_CHOICE_TIMEOUT_SEC
+    // 안에 응답 없으면(이 맵에 없으면) 나가기로 처리.
+    private readonly replay_by_session = new Map<string, boolean>();
+    private replay_timeout: Delayed | null = null;
+    // RETURN_TO_LOBBY 를 이미 보내고 내보낸 세션. replay:"N" 즉시 처리와 ResolveReplay 의 나가기 처리가
+    // 같은 세션을 두 번 건드릴 수 있어서(아래 KickToLobby 참고) 중복 방지용으로 둔다.
+    private readonly kicked_to_lobby = new Set<string>();
+    // 재게임을 신청한 유저가 방에 혼자 남아 새 상대를 기다리는 중이면 채워진다 (RemoveWaitingRoom 호출용으로 들고 있음).
+    // waiting_session 은 "기다리는 사람이 누구인지" — onLeave 에서 이 세션이 나갈 때만 대기 등록을 지워야 한다.
+    // (상대를 내보내는 client.leave() 호출의 onLeave 콜백이 비동기로 늦게 들어올 수 있어서, 단순히
+    //  "waiting_room_entry 가 있으면 지운다"로 하면 방금 등록한 걸 엉뚱한 onLeave 가 지워 버리는 경합이 생긴다)
+    private waiting_room_entry: WaitingRoomEntry | null = null;
+    private waiting_session: string | null = null;
+
+    // 게임 중(game_started && !game_over) 연결이 예기치 않게 끊긴 세션 관련 상태 (Phase 6).
+    // sessionId → RECONNECT_WAIT_SEC(5초) 뒤 봇을 투입하는 타이머. 그 전에 재접속하면(onReconnect) 취소한다.
+    private readonly bot_timeout_by_session = new Map<string, Delayed>();
+    // 봇이 대신 플레이 중인 세션 — 라운드 진행 자체는 (players 에서 지우지 않으므로) 기존 로직이 그대로
+    // 처리한다(선택 안 하면 CHOICE_TIMEOUT_SEC 뒤 자동 선택 — 사람이 느려서 자동 선택되는 것과 같은 경로).
+    // 이 Set 은 FinishGame 에서 win_is_bot/lose_is_bot 을 판정하는 용도로만 쓴다.
+    private readonly bot_sessions = new Set<string>();
+    // allowReconnection() 이 돌려준 재접속 대기 Deferred. 게임이 끝나면(FinishGame) 강제로 reject 해서
+    // 재접속 창을 닫는다 — 재접속은 "게임이 끝날 때까지"만 유효하다(게임 규칙 9번). reject 하면 Colyseus 가
+    // 곧바로 onLeave() 를 불러 최종 정리한다.
+    private readonly reconnection_by_session = new Map<string, Deferred<Client>>();
+
+    public onCreate(): void {
         // 이름/roomId 로 직접 들어올 수 없게 잠근다 — 예약된 좌석으로만 입장 가능
         this.lock();
         console.log(`[GameRoom] 생성됨 roomName=${this.roomName} roomId=${this.roomId}`);
 
+        // SEND_NOTICE 브로드캐스트 + 채널 유저 리포터(Watcher 의 ADMIN_CHANNEL_USER 용)가 이 방을 찾을 수 있도록 등록
+        RegisterRoom(this, () => this.GetChannelUserEntries());
+
         // 좌석 예약 후 SEAT_RESERVATION_SEC 안에 2명이 다 안 모이면 정리한다
         this.clock.setTimeout(() => this.CheckSeatFillTimeout(), SEAT_RESERVATION_SEC * 1000);
+
+        RegisterLoggedMessage(this, MessageType.ENTER_ROOM, (client) => {
+            this.HandleEnterRoom(client);
+        });
+        RegisterLoggedMessage<ReadyPayload>(this, MessageType.READY, (client, message) => {
+            this.HandleReady(client, message);
+        });
+        RegisterLoggedMessage<SelectGamePayload>(this, MessageType.SELECT_GAME, (client, message) => {
+            this.HandleSelectGame(client, message);
+        });
+        RegisterLoggedMessage<ReplayPayload>(this, MessageType.GAME_RESULT, (client, message) => {
+            this.HandleReplay(client, message);
+        });
     }
 
-    onJoin(client: Client, _options: unknown, auth?: GameSeatAuth): void {
+    public onJoin(client: Client, _options: unknown, auth?: GameSeatAuth): void {
         if (!auth?.user) {
             // 정상 흐름이라면 항상 RoomManager 가 좌석 예약에 유저 정보를 담아 보낸다.
             // 여기 걸리면 좌석 예약 없이(버그 또는 부정 접근으로) 들어온 것이다.
@@ -31,23 +151,168 @@ export class GameRoom extends Room {
         }
 
         this.players.set(client.sessionId, auth.user);
-        console.log(
-            `[GameRoom] 입장 sessionId=${client.sessionId} userid=${auth.user.userid} (현재 ${this.clients.length}/${this.maxClients}명)`
+        LogConnect(this, client, { userid: auth.user.userid });
+        this.SaveMyActiveGameRecord(client, auth.user.userid);
+        // ENTER_ROOM 응답은 소켓 입장 시점이 아니라, 클라이언트가 로딩을 끝내고 ENTER_ROOM 을
+        // 보내온 뒤(HandleEnterRoom)에 보낸다 — 클라이언트마다 로딩 시간이 다를 수 있기 때문.
+
+        if (this.waiting_room_entry) {
+            // 혼자 남아 새 상대를 기다리던 방에 방금 새 유저가 들어옴 — 기존 유저에게 알린다.
+            // Redis "기다리는 방" 목록에서는 로비가 TryJoinWaitingRoom 에서 이미 Pop 해 갔으므로 여기서는
+            // 우리 쪽 표시(waiting_room_entry)만 지운다 — onLeave 에서 더 이상 RemoveWaitingRoom 을 부르지 않게.
+            const waiting_client = this.clients.find((c) => c.sessionId !== client.sessionId);
+            if (waiting_client) {
+                const opponent_payload: OpponentJoinedPayload = { player: ToRoomPlayerInfo(auth.user) };
+                SendMessage(this, waiting_client, MessageType.OPPONENT_JOINED, opponent_payload);
+            }
+            this.waiting_room_entry = null;
+            this.waiting_session = null;
+        }
+    }
+
+    // 게임 중(game_started && !game_over) 연결이 예기치 않게 끊기면 이쪽으로 온다(Colyseus 가 CONSENTED
+    // 가 아닌 종료 코드일 때 onLeave 대신 호출). 재접속 대상이 아니면(게임 시작 전/후) 그냥 리턴한다 —
+    // Colyseus 가 곧바로 onLeave() 를 불러 지금까지와 같은 방식으로 정리한다.
+    public onDrop(client: Client, _code?: number): void {
+        if (!this.game_started || this.game_over) {
+            return;
+        }
+
+        const sessionId = client.sessionId;
+        console.log(`[GameRoom] 연결 끊김, 재접속 대기 roomId=${this.roomId} sessionId=${sessionId}`);
+
+        this.bot_timeout_by_session.set(
+            sessionId,
+            this.clock.setTimeout(() => {
+                this.bot_sessions.add(sessionId);
+                console.log(`[GameRoom] 봇 투입 roomId=${this.roomId} sessionId=${sessionId}`);
+            }, RECONNECT_WAIT_SEC * 1000)
         );
-        // Phase 5: 두 명 모두 ROOM_ENTER_ACK 를 보내면 GAME_START 전송
+
+        // "manual" — 시간 제한은 우리가 직접 관리한다. RECONNECT_WAIT_SEC(5초)는 봇을 투입하는 시점일
+        // 뿐이고, 재접속 자체는 게임이 끝날 때까지 받는다(FinishGame 에서 강제로 닫는다). 성공/실패 이후
+        // 처리는 onReconnect()/onLeave() 에서 한다 — 여기서 await 로 이어 처리하면 Colyseus 내부에 이미
+        // 걸려 있는 다른 .then() 콜백(예: allowReconnection 자체의 후처리)과 실행 순서가 보장되지 않는다.
+        this.reconnection_by_session.set(sessionId, this.allowReconnection(client, "manual"));
     }
 
-    onLeave(client: Client, code?: number): void {
-        console.log(`[GameRoom] 퇴장 sessionId=${client.sessionId} code=${code}`);
+    // 재접속 성공. this.players 는 onDrop 이후에도 지우지 않았으므로(disconnected 상태에서도 좌석 유지)
+    // 그대로 쓰면 된다 — 진행 중이던 라운드도 players.size 가 줄지 않아 기존 로직이 멈추지 않고 계속
+    // 진행돼 있었다. Colyseus 는 재접속 시 onJoin 을 다시 부르지 않으므로 여기서 우리 쪽 상태만 되돌린다.
+    public onReconnect(client: Client): void {
+        const sessionId = client.sessionId;
+        this.bot_timeout_by_session.get(sessionId)?.clear();
+        this.bot_timeout_by_session.delete(sessionId);
+        this.bot_sessions.delete(sessionId);
+        this.reconnection_by_session.delete(sessionId);
+        console.log(`[GameRoom] 재접속 roomId=${this.roomId} sessionId=${sessionId}`);
+
+        // reconnectionToken 은 (재)입장마다 새로 발급되므로, 다음에 또 끊겼을 때(F5 등으로 로비를 거쳐
+        // 돌아올 경우 대비) 로비가 최신 토큰으로 재접속을 시도할 수 있도록 다시 저장해 둔다.
+        const user = this.players.get(sessionId);
+        if (user) this.SaveMyActiveGameRecord(client, user.userid);
+    }
+
+    public onLeave(client: Client, code?: number): void {
+        LogDisconnect(this, client, code);
+        const left_user = this.players.get(client.sessionId);
         this.players.delete(client.sessionId);
-        // Phase 6 에서 allowReconnection 으로 재접속 유예(5초) 처리 추가
+        this.entered_by_session.delete(client.sessionId);
+        this.ready_by_session.delete(client.sessionId);
+        this.choice_by_session.delete(client.sessionId);
+        this.win_count_by_session.delete(client.sessionId);
+        // Phase 6 이후에도 onLeave 가 라운드 진행 중에 불릴 수 있는 경우가 남아 있다 — 클라이언트가
+        // 명시적으로 나가기(consented, 예: Protocol.LEAVE_ROOM)를 요청한 경우는 onDrop 을 거치지 않고
+        // 곧장 여기로 온다(재접속 대상이 아니므로). 그 경우를 위해 라운드 타이머를 멈춘다. 예기치 않은
+        // 연결 끊김(onDrop 경유)이 여기로 오는 시점은 이미 game_over=true 이후(재접속 실패로 최종 정리될
+        // 때)뿐이라 이 시점엔 애초에 멈출 타이머가 없다.
+        this.round_active = false;
+        this.remain_time_interval?.clear();
+        this.remain_time_interval = null;
+        this.replay_by_session.delete(client.sessionId);
+        this.bot_timeout_by_session.get(client.sessionId)?.clear();
+        this.bot_timeout_by_session.delete(client.sessionId);
+        this.bot_sessions.delete(client.sessionId);
+        this.reconnection_by_session.delete(client.sessionId);
+        // 이 유저는 최종적으로 나갔다 — 로비가 더 이상 이 방으로 재접속을 안내하면 안 되므로 지운다.
+        // (F5 로 로비에 다시 들어왔는데 이미 끝난/나간 방으로 안내되는 것을 막는다.)
+        if (left_user) {
+            RemoveActiveGame(left_user.userid).catch((error) => {
+                console.error(`[GameRoom] RemoveActiveGame 실패 roomId=${this.roomId}:`, error instanceof Error ? error.message : error);
+            });
+        }
+
+        if (this.waiting_room_entry && client.sessionId === this.waiting_session) {
+            // 새 상대를 기다리던 그 유저가 나갔다 — Redis "기다리는 방" 목록에서도 지운다.
+            // (다른 클라이언트의 onLeave 가 비동기로 뒤늦게 들어온 경우는 여기 해당 안 됨 — sessionId 로 구분)
+            RemoveWaitingRoom(this.waiting_room_entry).catch((error) => {
+                console.error(`[GameRoom] RemoveWaitingRoom 실패 roomId=${this.roomId}:`, error instanceof Error ? error.message : error);
+            });
+            this.waiting_room_entry = null;
+            this.waiting_session = null;
+        }
+
+        // 남은 상대에게 알린다. (this.clients 는 이 시점에 이미 나간 client 가 제거된 상태 —
+        // Colyseus Room._onLeave 가 clients.delete() 후에 onLeave 를 호출한다)
+        // 재접속이 걸려 있던 세션(onDrop 경유)이었다면 이 시점은 이미 재접속에 실패해 최종적으로
+        // 나간 것이므로, 여느 퇴장과 똑같이 OUT_USER 를 보낸다.
+        if (left_user) {
+            const payload: OutUserPayload = { userid: left_user.userid };
+            for (const remaining_client of this.clients) {
+                SendMessage(this, remaining_client, MessageType.OUT_USER, payload);
+            }
+        }
+
+        // 재게임/나가기 응답을 기다리는 중(game_over && replay_timeout 이 아직 안 지워짐)에 상대가 나갔고
+        // 남은 유저가 이미 응답(재게임/나가기 어느 쪽이든)을 마쳤다면, REMATCH_CHOICE_TIMEOUT_SEC 이 다
+        // 지나기를 기다리지 않고 바로 마무리한다 — HandleReplay 에서 "상대가 이미 응답했으면 즉시 마무리"
+        // 하는 것과 같은 이유다. 이게 없으면 재게임을 이미 신청한 유저가 상대의 갑작스런 퇴장 이후에도
+        // 남은 시간만큼 그냥 기다리기만 하다가 뒤늦게 "새 상대 기다리는 방"으로 넘어갔다(사용자 요청으로 수정).
+        if (this.game_over && this.replay_timeout) {
+            const remaining_sessions = [...this.players.keys()];
+            const all_remaining_responded = remaining_sessions.every((sessionId) => this.replay_by_session.has(sessionId));
+            if (remaining_sessions.length > 0 && all_remaining_responded) {
+                this.ResolveReplay();
+            }
+        }
     }
 
-    onDispose(): void {
+    public onDispose(): void {
+        UnregisterRoom(this);
         console.log(`[GameRoom] 제거됨 roomId=${this.roomId}`);
     }
 
+    // ADMIN_CHANNEL_USER 용 — 지금 이 방에 있는 유저의 userid + roomId. room 필드는 지금은 Colyseus
+    // roomId 문자열을 그대로 쓴다 (ENTER_ROOM 의 room 필드와 같은 미확정 사항 — types.ts 참고)
+    public GetChannelUserEntries(): AdminChannelUserEntry[] {
+        return [...this.players.values()].map((user) => ({ userid: user.userid, room: this.roomId }));
+    }
+
+    // 로비가 F5 등으로 다시 들어온 유저를 이 방으로 재접속시킬 수 있도록, "이 userid 는 지금 이 방에
+    // 있다"를 Redis 에 기록한다. onJoin(최초 입장)과 onReconnect(재접속 성공) 양쪽에서 부른다 —
+    // reconnectionToken 이 매번 새로 발급되므로 매번 다시 저장해야 최신 토큰으로 안내할 수 있다.
+    private SaveMyActiveGameRecord(client: Client, userid: string): void {
+        const entry: ActiveGameEntry = {
+            room_name: this.roomName,
+            room_id: this.roomId,
+            reconnection_token: client.reconnectionToken,
+        };
+        SaveActiveGame(userid, entry).catch((error) => {
+            console.error(`[GameRoom] SaveActiveGame 실패 roomId=${this.roomId}:`, error instanceof Error ? error.message : error);
+        });
+    }
+
     private CheckSeatFillTimeout(): void {
+        // 이 타이머는 "방 생성 후 SEAT_RESERVATION_SEC 안에 좌석 예약 2개가 다 소비됐는지"만 확인하는
+        // 1회성 체크다. 게임이 이미 시작됐다면 두 좌석 모두 한 번은 채워졌던 것이 확실하므로(HandleReady
+        // 가 players.size===PLAYERS_PER_ROOM 을 이미 확인했다) 더 이상 의미가 없다 — 그냥 둔다.
+        // ⚠️ 실제로 겪은 버그: 이 가드 없이는, 게임 시작 후 우연히 이 타이머가 도는 시점(방 생성 10초 뒤)에
+        // 누군가 재접속 유예 중이라 this.clients.length 가 잠깐 1이면(this.players 는 안 지웠지만
+        // this.clients 는 지워짐), "처음부터 한 명만 온 방"으로 오인해서 game_started 여부와 상관없이
+        // this.disconnect() 로 양쪽을 통째로 끊어버렸다 — 재접속 유예/봇 진행 중인 게임이 갑자기 끊기는 심각한 버그였다.
+        if (this.game_started) {
+            return;
+        }
         if (this.clients.length === PLAYERS_PER_ROOM) {
             return; // 정상 — 2명 다 들어옴
         }
@@ -55,9 +320,337 @@ export class GameRoom extends Room {
         if (this.clients.length === 1) {
             // 새로 만든 방에서 한 명만 들어온 경우 — 로비로 돌려보낸다.
             // ("기다리는 방"에 들어오기로 한 유저가 안 온 경우의 재등록 처리는 Phase 5 에서 추가)
-            SendMessage(this.clients[0], MessageType.RETURN_TO_LOBBY, {});
+            SendMessage(this, this.clients[0], MessageType.RETURN_TO_LOBBY, {});
         }
 
         this.disconnect(CloseCode.WITH_ERROR);
+    }
+
+    // ENTER_ROOM (C→S) — 클라이언트가 로딩 등 준비를 마치면 보낸다(payload 없음). 두 명 다 처음 보내면
+    // 그제서야 ENTER_ROOM (S→C) 로 방/상대 정보를 응답한다.
+    // ⚠️ 실제로 겪은 버그: 이미 한 번 응답을 보낸 뒤(enter_room_sent=true)에는 무조건 무시했었다 —
+    // 재접속(F5→REJOIN_GAME→client.reconnect())한 클라이언트는 onJoin 을 다시 안 타서(Colyseus 특성,
+    // "재접속/봇 대체" 참고) player1/player2 정보를 다시 받을 방법이 ENTER_ROOM 재요청뿐인데, 그 요청이
+    // 조용히 버려져서 게임 참여자 정보를 표시할 수 없었다. **해결**: 이미 보낸 뒤에도 요청한 클라이언트
+    // 에게만 같은 정보를 즉시 다시 보낸다(둘 다 다시 보내야 할 필요 없음 — "둘 다 보내야 응답"하는
+    // 조건은 최초 한 번만 만족하면 된다).
+    private HandleEnterRoom(client: Client): void {
+        this.entered_by_session.add(client.sessionId);
+
+        // 상대가 아직 안 들어왔거나(최초) 완전히 나가서(재접속 실패까지 끝남) 없으면 응답할 수 없다
+        if (this.players.size < PLAYERS_PER_ROOM) return;
+
+        if (this.enter_room_sent) {
+            this.SendEnterRoomTo(client);
+            return;
+        }
+
+        const all_entered = [...this.players.keys()].every((sessionId) => this.entered_by_session.has(sessionId));
+        if (!all_entered) return;
+
+        this.enter_room_sent = true;
+        this.SendEnterRoom();
+    }
+
+    // 두 명 다 처음 ENTER_ROOM 을 보내면 양쪽에 응답한다. player1 = 먼저 입장한 쪽 (players 는 입장 순서를 유지하는 Map)
+    private SendEnterRoom(): void {
+        for (const client of this.clients) {
+            this.SendEnterRoomTo(client);
+        }
+    }
+
+    // 한 클라이언트에게만 방/상대 정보를 보낸다 — 최초 응답과, 재접속 후 재요청 응답 둘 다 여기를 쓴다.
+    private SendEnterRoomTo(client: Client): void {
+        const [user_a, user_b] = [...this.players.values()];
+        const payload: EnterRoomPayload = {
+            result: "Y",
+            room: this.roomId,
+            player1: ToRoomPlayerInfo(user_a),
+            player2: ToRoomPlayerInfo(user_b),
+        };
+        SendMessage(this, client, MessageType.ENTER_ROOM, payload);
+    }
+
+    private HandleReady(client: Client, message: ReadyPayload): void {
+        if (message?.ready !== "Y" && message?.ready !== "N") {
+            return; // 형식이 잘못된 요청은 무시한다 (문서에 실패 응답이 없음)
+        }
+
+        this.ready_by_session.set(client.sessionId, message.ready === "Y");
+
+        if (this.game_started) return; // 이미 시작된 뒤에는 더 반응하지 않는다
+        if (this.players.size < PLAYERS_PER_ROOM) return; // 아직 상대가 안 들어옴
+
+        const all_ready = [...this.players.keys()].every(
+            (sessionId) => this.ready_by_session.get(sessionId) === true
+        );
+        if (!all_ready) return;
+
+        this.StartGame();
+    }
+
+    // GAME_START 를 보내고 첫 판을 예약한다. 최초 시작(HandleReady)과 같은 상대와의 재게임(ResolveReplay)
+    // 둘 다 여기를 쓴다 — 재게임은 "다시 GAME_START 부터" 시작하고 READY 를 다시 받지 않는다 (TASKS.md Phase 5-4)
+    private StartGame(): void {
+        this.game_started = true;
+        this.game_over = false;
+        this.game_started_at = new Date();
+        this.plays.length = 0;
+        for (const room_client of this.clients) {
+            SendMessage(this, room_client, MessageType.GAME_START, {});
+        }
+
+        // GAME_START 연출(모션)을 클라이언트가 처리할 시간을 준 뒤 첫 판 시작을 알린다
+        this.clock.setTimeout(() => this.SendOneStart(), GAME_START_DELAY_SEC * 1000);
+    }
+
+    // ONE_START (S→C) — 한 판을 시작한다. 이후 1초마다 ONE_REMAIN_TIME 으로 남은 초를 알리고,
+    // count 가 0 이 되면(=CHOICE_TIMEOUT_SEC 안에 SELECT_GAME 이 안 오면) 자동 선택으로 판을 마무리한다
+    private SendOneStart(): void {
+        // 상대가 완전히 나갔으면(OUT_USER 로 이미 알림) 판을 더 진행하지 않는다. 재접속 대기 중이거나
+        // 봇이 대신하는 중인 세션은 onDrop 이후에도 players 에서 지우지 않으므로 이 가드에 걸리지 않고
+        // 라운드가 그대로 진행된다(선택을 안 내면 아래 CHOICE_TIMEOUT_SEC 자동 선택으로 봇 역할을 한다).
+        if (this.players.size < PLAYERS_PER_ROOM || this.game_over) return;
+
+        this.choice_by_session.clear();
+        this.round_active = true;
+
+        const start_payload: OneStartPayload = { count: CHOICE_TIMEOUT_SEC };
+        for (const client of this.clients) {
+            SendMessage(this, client, MessageType.ONE_START, start_payload);
+        }
+
+        let remaining = CHOICE_TIMEOUT_SEC - 1;
+        this.remain_time_interval = this.clock.setInterval(() => {
+            const remain_payload: OneRemainTimePayload = { count: remaining };
+            for (const client of this.clients) {
+                SendMessage(this, client, MessageType.ONE_REMAIN_TIME, remain_payload);
+            }
+
+            if (remaining === 0) {
+                this.remain_time_interval?.clear();
+                this.remain_time_interval = null;
+                this.ResolveRound();
+            } else {
+                remaining--;
+            }
+        }, 1000);
+    }
+
+    private HandleSelectGame(client: Client, message: SelectGamePayload): void {
+        if (!this.round_active || this.game_over) return;
+        if (message?.select !== "가위" && message?.select !== "바위" && message?.select !== "보") {
+            return; // 형식이 잘못된 요청은 무시한다 (문서에 실패 응답이 없음)
+        }
+
+        this.choice_by_session.set(client.sessionId, message.select);
+
+        const all_selected = [...this.players.keys()].every((sessionId) => this.choice_by_session.has(sessionId));
+        if (all_selected) {
+            this.ResolveRound();
+        }
+    }
+
+    // 판을 마무리한다. CHOICE_TIMEOUT_SEC 안에 선택하지 못한 유저는 무작위로 자동 선택한다
+    private ResolveRound(): void {
+        if (!this.round_active) return; // 이미 처리됨 (자동 선택 타임아웃과 양쪽 선택 완료가 겹친 경우)
+        this.round_active = false;
+        this.remain_time_interval?.clear();
+        this.remain_time_interval = null;
+
+        if (this.players.size < PLAYERS_PER_ROOM) return; // 상대가 완전히 나가서(재접속 실패까지 끝남) 판정할 수 없음
+
+        for (const sessionId of this.players.keys()) {
+            if (!this.choice_by_session.has(sessionId)) {
+                this.choice_by_session.set(sessionId, PickRandomChoice());
+            }
+        }
+
+        const [session_a, session_b] = [...this.players.keys()];
+        const choice_a = this.choice_by_session.get(session_a)!;
+        const choice_b = this.choice_by_session.get(session_b)!;
+        const judge = JudgeChoice(choice_a, choice_b);
+        const winner_session = judge === 1 ? session_a : judge === -1 ? session_b : null;
+
+        const payload: OneResultPayload = { player1: choice_a, player2: choice_b };
+        if (winner_session) {
+            payload.win = this.players.get(winner_session)!.userid;
+        }
+        for (const client of this.clients) {
+            SendMessage(this, client, MessageType.ONE_RESULT, payload);
+        }
+
+        if (!winner_session) {
+            // 무승부 — 판 수에 넣지 않고 같은 판을 다시 진행. 결과를 보여줄 시간을 준 뒤 다음 ONE_START
+            this.plays.push({ draw: choice_a }); // 무승부는 둘이 같은 값을 낸 경우라 choice_a == choice_b
+            this.clock.setTimeout(() => this.SendOneStart(), ONE_RESULT_DELAY_SEC * 1000);
+            return;
+        }
+
+        const winner_choice = winner_session === session_a ? choice_a : choice_b;
+        const loser_choice = winner_session === session_a ? choice_b : choice_a;
+        this.plays.push({ win: winner_choice, lose: loser_choice });
+
+        const win_count = (this.win_count_by_session.get(winner_session) ?? 0) + 1;
+        this.win_count_by_session.set(winner_session, win_count);
+
+        if (win_count >= WIN_COUNT_TO_FINISH) {
+            this.FinishGame(session_a, session_b);
+        } else {
+            this.clock.setTimeout(() => this.SendOneStart(), ONE_RESULT_DELAY_SEC * 1000);
+        }
+    }
+
+    // 둘 중 하나가 WIN_COUNT_TO_FINISH 판을 먼저 이겨서 게임이 끝났을 때 최종 결과를 보낸다
+    private async FinishGame(session_a: string, session_b: string): Promise<void> {
+        this.game_over = true;
+
+        // 재접속 창을 닫는다 — 재접속은 "게임이 끝날 때까지"만 유효하다(게임 규칙 9번). 아직 재접속하지
+        // 못한 세션이 있으면 강제로 reject 해서 Colyseus 가 곧바로 onLeave() 로 최종 정리하게 한다
+        // (안 닫으면 "manual" 모드라 그 좌석이 영원히 예약된 채로 남아 방이 정리되지 않는다).
+        for (const sessionId of [session_a, session_b]) {
+            this.reconnection_by_session.get(sessionId)?.reject();
+        }
+
+        const count_a = this.win_count_by_session.get(session_a) ?? 0;
+        const count_b = this.win_count_by_session.get(session_b) ?? 0;
+        const winner_session = count_a > count_b ? session_a : session_b;
+        const loser_session = winner_session === session_a ? session_b : session_a;
+        const winner_user = this.players.get(winner_session)!;
+        const loser_user = this.players.get(loser_session)!;
+        // "게임이 끝날 때" 그 세션이 봇으로 플레이 중이었는지 — 재접속했으면 이미 onReconnect 에서 지워졌다.
+        const winner_is_bot = this.bot_sessions.has(winner_session);
+        const loser_is_bot = this.bot_sessions.has(loser_session);
+
+        const payload: GameResultPayload = { player1: count_a, player2: count_b, win: winner_user.userid };
+        for (const client of this.clients) {
+            SendMessage(this, client, MessageType.GAME_RESULT, payload);
+        }
+
+        // 재게임/나가기 선택을 기다린다. REMATCH_CHOICE_TIMEOUT_SEC 안에 응답 없는 쪽은 나가기로 처리한다.
+        // (아래 DB 저장을 기다리지 않고 먼저 시작한다 — 결과 화면/재게임 응답까지 DB 왕복 시간만큼 늦어지면 안 된다)
+        this.replay_by_session.clear();
+        this.replay_timeout = this.clock.setTimeout(() => this.ResolveReplay(), REMATCH_CHOICE_TIMEOUT_SEC * 1000);
+
+        try {
+            const result = await SaveGameResult({
+                winner_userid: winner_user.userid,
+                loser_userid: loser_user.userid,
+                loser_win_count: Math.min(count_a, count_b),
+                start_time: this.game_started_at ?? new Date(),
+                end_time: new Date(),
+                // 스냅샷(복사본)을 넘긴다 — 이 DB 저장이 끝나기 전에 재게임으로 StartGame() 이 다시 불리면
+                // this.plays 가 즉시 비워지는데(다음 게임 준비), 원본 배열 참조를 그대로 넘기면 그 시점에
+                // 아직 비동기로 대기 중이던 이 요청까지 빈 배열을 저장하게 된다 — 실제로 겪은 버그.
+                plays: [...this.plays],
+                win_is_bot: winner_is_bot,
+                lose_is_bot: loser_is_bot,
+            });
+            // 게임방 메모리의 플레이어 정보도 최신 값으로 갱신 — 재게임할 때(ENTER_ROOM 의 win_per) 반영되도록.
+            // 그 사이 나간 세션이면 다시 만들어 넣지 않는다 (has 로 확인).
+            if (this.players.has(winner_session)) this.players.set(winner_session, result.winner);
+            if (this.players.has(loser_session)) this.players.set(loser_session, result.loser);
+        } catch (error) {
+            console.error(`[GameRoom] 게임 결과 저장 실패 roomId=${this.roomId}:`, error instanceof Error ? error.message : error);
+        }
+    }
+
+    // GAME_RESULT (C→S) — 게임이 끝난 뒤 재게임 여부 응답. replay:"N" 은 상대 응답을 기다리지 않고
+    // 이 유저만 바로 내보낸다(문서에 없는 확장). 아무 응답도 없으면(문서 기준) 타임아웃으로 나가기 처리된다.
+    private HandleReplay(client: Client, message: ReplayPayload): void {
+        if (!this.game_over) return; // 게임이 끝나기 전에는 의미 없는 요청 — 무시
+        if (message?.replay !== "Y" && message?.replay !== "N") return; // 형식이 잘못된 요청은 무시
+        if (this.replay_by_session.has(client.sessionId)) return; // 이미 응답함
+
+        this.replay_by_session.set(client.sessionId, message.replay === "Y");
+
+        if (message.replay === "N") {
+            // 상대가 아직 응답 안 했어도(또는 이미 재게임을 골랐어도) 상관없이 이 유저는 바로 나간다
+            this.KickToLobby(client);
+        }
+
+        // 남은 유저 전원이 응답을 마쳤으면(재게임이든 나가기든) 타임아웃을 기다리지 않고 바로 마무리한다
+        const all_responded = [...this.players.keys()].every((sessionId) => this.replay_by_session.has(sessionId));
+        if (all_responded) {
+            this.ResolveReplay();
+        }
+    }
+
+    // RETURN_TO_LOBBY 를 보내고 연결을 끊는다. 같은 세션에 두 번 호출돼도 안전하다(HandleReplay 의 즉시
+    // 나가기 처리와 ResolveReplay 의 나가기 처리가 겹칠 수 있어서 — kicked_to_lobby 로 막는다).
+    private KickToLobby(client: Client): void {
+        if (this.kicked_to_lobby.has(client.sessionId)) return;
+        this.kicked_to_lobby.add(client.sessionId);
+        SendMessage(this, client, MessageType.RETURN_TO_LOBBY, {});
+        client.leave(CloseCode.CONSENTED);
+    }
+
+    // 재게임 응답을 마무리한다 (둘 다 응답했거나, REMATCH_CHOICE_TIMEOUT_SEC 초과)
+    private ResolveReplay(): void {
+        if (!this.game_over) return; // 이미 처리됨 (타임아웃과 응답 완료가 겹친 경우)
+        this.replay_timeout?.clear();
+        this.replay_timeout = null;
+
+        const sessions = [...this.players.keys()];
+        const replaying_sessions = sessions.filter((sessionId) => this.replay_by_session.get(sessionId) === true);
+        const leaving_sessions = sessions.filter((sessionId) => !replaying_sessions.includes(sessionId));
+
+        for (const sessionId of leaving_sessions) {
+            const client = this.clients.find((c) => c.sessionId === sessionId);
+            if (client) this.KickToLobby(client);
+        }
+
+        if (replaying_sessions.length === PLAYERS_PER_ROOM) {
+            // 둘 다 재게임 — 같은 방, 같은 상대로 새 게임 시작 (다시 GAME_START 부터, READY 는 다시 안 받음)
+            // (leaving_sessions.length 만으로는 판단하지 않는다 — 상대가 이미 연결이 끊겨 sessions 자체가
+            //  1명뿐인 경우에도 leaving_sessions 는 비어 있을 수 있어서, "정말 둘 다 있고 둘 다 재게임"인지
+            //  replaying_sessions.length 로 직접 확인해야 한다)
+            this.ResetRoundState();
+            this.StartGame();
+        } else if (replaying_sessions.length === 1) {
+            // 한 명만 재게임 — 남은 유저는 새 상대를 기다린다. 상대가 있었다면 위 루프에서 이미 내보냈다.
+            this.WaitForNewOpponent(replaying_sessions[0]);
+        }
+        // replaying_sessions.length === 0 이면 남은 유저도 위 루프로 이미 정리됐다 — 방은 비면서 자동 정리(dispose)됨
+    }
+
+    // 한 판/한 게임 상태를 초기화한다 (같은 상대와의 재게임, 새 상대와의 재매칭 둘 다에서 쓴다)
+    private ResetRoundState(): void {
+        this.win_count_by_session.clear();
+        this.choice_by_session.clear();
+        this.round_active = false;
+        this.remain_time_interval?.clear();
+        this.remain_time_interval = null;
+        this.game_over = false;
+        this.replay_by_session.clear();
+        this.replay_timeout?.clear();
+        this.replay_timeout = null;
+        this.kicked_to_lobby.clear();
+    }
+
+    // 재게임을 신청했는데 상대가 나가서 혼자 남았을 때 — "기다리는 방"으로 등록하고 새 상대를 기다린다.
+    // 대기 시간에는 제한이 없다 (CLAUDE.md 게임 규칙 12번). 새 상대는 onJoin 에서 OPPONENT_JOINED 로 알린다.
+    private WaitForNewOpponent(remaining_session: string): void {
+        const remaining_user = this.players.get(remaining_session);
+        if (!remaining_user) return; // 그 사이 이 유저도 나갔다면 더 할 게 없다
+
+        // 새 상대와는 ENTER_ROOM 부터 다시 진행한다 ("처음 게임과 같은 흐름" — TASKS.md Phase 5-4)
+        this.ResetRoundState();
+        this.entered_by_session.clear();
+        this.enter_room_sent = false;
+        this.ready_by_session.clear();
+        this.game_started = false;
+
+        const entry: WaitingRoomEntry = {
+            channel_no: ParseGameChannelNo(this.roomName),
+            room_name: this.roomName,
+            room_id: this.roomId,
+            opponent: { name: remaining_user.name, avatar: remaining_user.avatar },
+        };
+        this.waiting_room_entry = entry;
+        this.waiting_session = remaining_session;
+        PushWaitingRoom(entry).catch((error) => {
+            console.error(`[GameRoom] PushWaitingRoom 실패 roomId=${this.roomId}:`, error instanceof Error ? error.message : error);
+        });
     }
 }
