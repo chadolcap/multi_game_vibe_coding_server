@@ -13,18 +13,26 @@ export interface GameLogEntry {
     end_time: Date;
     win: string; // 승자 userid
     lose: string; // 패자 userid
-    score: string; // "2:0" | "2:1"
+    vs: string; // 승자 기준 "2:0" | "2:1" (예전엔 이 자리가 "score" 컬럼이었다 — 2026-10-01 이름 변경)
+    score: number; // 이번 판에서 승자가 실제로 획득한 점수(SCORE_WIN_STRAIGHT/SCORE_WIN_NORMAL)
     plays: PlayRecord[];
     win_is_bot: boolean;
     lose_is_bot: boolean;
 }
 
-// 승자/패자의 total_game_count / total_win_count / today_game_count / today_win_count 를 1씩 올린다.
-// today_date 가 오늘과 다르면(자정이 지난 뒤 첫 게임) today_game_count/today_win_count 를 1(또는 0)로
+// 승자/패자의 total_game_count / total_win_count / today_game_count / today_win_count 와
+// total_score / today_score(이번 판 획득 점수 누적, 2026-10-01 추가)를 갱신한다.
+// today_date 가 오늘과 다르면(자정이 지난 뒤 첫 게임) today_* 를 1(또는 0, 점수는 이번 판 값)로
 // 리셋하고 today_date 를 오늘로 갱신한다 — 이게 실제 롤오버가 일어나는 지점이다. 게임을 안 하는 유저는
 // today_date 가 영영 안 바뀔 수 있지만, 조회 시점(queries/userInfo.ts SELECT_USER_INFO_SQL)에서 이미
 // today_date != CURDATE() 면 0 으로 보정해서 보여주므로 문제없다 (Phase 8, "지연 초기화").
-export async function UpdatePlayInfoAfterGame(pool: Pool, winner_userid: string, loser_userid: string): Promise<void> {
+export async function UpdatePlayInfoAfterGame(
+    pool: Pool,
+    winner_userid: string,
+    loser_userid: string,
+    winner_score: number,
+    loser_score: number
+): Promise<void> {
     const connection = await pool.getConnection();
     try {
         await connection.beginTransaction();
@@ -32,20 +40,24 @@ export async function UpdatePlayInfoAfterGame(pool: Pool, winner_userid: string,
             `UPDATE user_play_info SET
                 total_game_count = total_game_count + 1,
                 total_win_count  = total_win_count + 1,
+                total_score      = total_score + ?,
                 today_game_count = IF(today_date = CURDATE(), today_game_count + 1, 1),
                 today_win_count  = IF(today_date = CURDATE(), today_win_count + 1, 1),
+                today_score      = IF(today_date = CURDATE(), today_score + ?, ?),
                 today_date = CURDATE()
              WHERE userid = ?`,
-            [winner_userid]
+            [winner_score, winner_score, winner_score, winner_userid]
         );
         await connection.query(
             `UPDATE user_play_info SET
                 total_game_count = total_game_count + 1,
+                total_score      = total_score + ?,
                 today_game_count = IF(today_date = CURDATE(), today_game_count + 1, 1),
                 today_win_count  = IF(today_date = CURDATE(), today_win_count, 0),
+                today_score      = IF(today_date = CURDATE(), today_score + ?, ?),
                 today_date = CURDATE()
              WHERE userid = ?`,
-            [loser_userid]
+            [loser_score, loser_score, loser_score, loser_userid]
         );
         await connection.commit();
     } catch (error) {
@@ -77,13 +89,14 @@ export async function InsertGameLog(pool: Pool, entry: GameLogEntry): Promise<vo
     const table_name = await EnsureGameLogTable(pool, entry.end_time);
     await pool.query(
         `INSERT INTO \`${table_name}\`
-            (start_time, end_time, win, lose, score, plays, win_is_bot, lose_is_bot)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            (start_time, end_time, win, lose, vs, score, plays, win_is_bot, lose_is_bot)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
             entry.start_time,
             entry.end_time,
             entry.win,
             entry.lose,
+            entry.vs,
             entry.score,
             JSON.stringify(entry.plays),
             entry.win_is_bot ? 1 : 0,

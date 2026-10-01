@@ -20,10 +20,12 @@ export const MessageType = {
                                            // (LOBBY_ENTERED 는 폐지 — 문서 반영)
     NAME: "NAME",                         // C→S 요청 { name } / S→C 결과 { result, error? }
     PLAY_INFO: "PLAY_INFO",               // C→S 요청(payload 없음) / S→C 결과 { result, total_game_count, ... }
-    // C→S { period: "daily"|"weekly" } / S→C 같은 type 재사용, { result:"Y", period, rank_list, my_rank,
-    // my_score } — 1~100위 목록 + 본인 순위/점수(100위 밖이어도 항상 옴). 문서(통신규약 시트)에 랭킹
-    // 조회 메시지가 없어 CLAUDE.md 가 기준이다(Phase 8).
-    RANK_INFO: "RANK_INFO",
+    // C→S 요청(payload 없음) / S→C 같은 type 재사용, { date, list:[[name,score],...], my:{rank,score} }
+    // — 일간 랭킹. 2026-10-01 통신규약 시트에 추가됨(문서 기준).
+    RANK_DAILY: "RANK_DAILY",
+    // C→S 요청(payload 없음) / S→C 같은 type 재사용, { term:{start,end}, list:[[name,score],...], my:{rank,score} }
+    // — 주간 랭킹. 2026-10-01 통신규약 시트에 추가됨(문서 기준).
+    RANK_WEEKLY: "RANK_WEEKLY",
     JOIN_MATCH: "JOIN_MATCH",             // C→S { select: "Y"|"N" } — Y: 게임 참여(매칭 대기열 등록), N: 매칭 대기 취소
                                            // (CANCEL_MATCH 는 더 이상 안 쓴다 — JOIN_MATCH 로 통합됨, 문서 반영)
     MATCH_FOUND: "MATCH_FOUND",           // S→C
@@ -142,31 +144,38 @@ export interface PlayInfoResultPayload {
     today_win_count: number;
 }
 
-// RANK_INFO 로 클라이언트가 보내는 값 — 일간/주간 중 어느 랭킹을 조회할지 (Phase 8)
-export type RankPeriod = "daily" | "weekly";
+// 랭킹 조회(Phase 8) — 로컬 엑셀본 "통신규약" 시트에 2026-10-01 RANK_DAILY/RANK_WEEKLY 로 추가됐다.
+// 문서가 기준이므로 그 스펙(별도 메시지 2개, list 는 [name, score] 튜플 배열)을 그대로 따른다.
+// ⚠️ 문서 비고(H15/H17)에는 "상위 10명"이라고 적혀 있지만, 몇 명을 보여줄지는 클라이언트 표시 문제로
+// 보고 서버는 그대로 RANKING_LIST_SIZE(100)개를 보낸다(2026-10-01 사용자 결정) — 클라이언트가 그중
+// 원하는 만큼만 잘라서 보여주면 된다.
 
-export interface RankInfoPayload {
-    period: RankPeriod;
-}
+// 랭킹 목록 한 줄 — 문서 payload 예시(`list:[[name, score], ...]`)대로 튜플이다. 순위 번호(동점자는
+// 같은 순위 — db/queries/ranking.ts 의 RANK() 윈도우 함수)는 목록 안에는 안 넣는다(문서에 없음) —
+// 필요하면 클라이언트가 배열 인덱스로 매긴다. 본인 순위는 `my.rank` 로 따로 온다.
+export type RankListEntry = [name: string, score: number];
 
-// 랭킹 목록 한 줄. rank 는 동점자가 같은 순위를 받는 표준 방식(RANK() 윈도우 함수 — "내 점수보다 높은
-// 사람 수 + 1" 과 같은 결과, db/queries/ranking.ts 참고)
-export interface RankEntry {
+// 본인 순위/점수 — rank_daily/rank_weekly 에 이번 기간 기록이 없어도(100위 밖이거나 아예 참여 안 했어도)
+// 항상 채워진다(0점 기준으로 순위 계산, db/queries/ranking.ts GetMyRank 참고).
+export interface RankMyInfo {
     rank: number;
-    userid: string;
-    name: string;
     score: number;
 }
 
-// RANK_INFO 결과 응답 (S→C, type 재사용). 문서에 실패 케이스가 없다(PLAY_INFO 와 같은 패턴) — ENTER_LOBBY
-// 를 아직 안 했거나 형식이 잘못된 요청은 조용히 무시한다. rank_list 는 1~RANKING_LIST_SIZE(100)위,
-// my_rank/my_score 는 그 목록에 없어도(100위 밖, 오늘/이번 주 기록이 아예 없어도) 항상 채워진다.
-export interface RankInfoResultPayload {
-    result: "Y";
-    period: RankPeriod;
-    rank_list: RankEntry[];
-    my_rank: number;
-    my_score: number;
+// RANK_DAILY — C→S 요청(payload 없음, 로그인=ENTER_LOBBY 이후) / S→C 같은 type 재사용.
+// date 는 오늘 날짜("YYYY.MM.DD", 문서 예시 형식 그대로).
+export interface RankDailyResultPayload {
+    date: string;
+    list: RankListEntry[];
+    my: RankMyInfo;
+}
+
+// RANK_WEEKLY — C→S 요청(payload 없음) / S→C 같은 type 재사용.
+// term 은 이번 주 월요일~일요일("YYYY.MM.DD").
+export interface RankWeeklyResultPayload {
+    term: { start: string; end: string };
+    list: RankListEntry[];
+    my: RankMyInfo;
 }
 
 // 로비/게임에서 쓰는 유저 정보 — Redis 캐시, ENTER_LOBBY 성공 응답, 좌석 예약에 담기는 값의 바탕이 된다.
@@ -301,12 +310,24 @@ export interface OneResultPayload {
     win?: string;
 }
 
-// GAME_RESULT — 최종 결과 (S→C). player1/player2 는 각자 이긴 판 수, win 은 최종 승자 userid.
+// GAME_RESULT 의 winner/loser — win_count 는 이번 게임에서 이긴 판 수(무승부 제외), win_per 은
+// total_win_count 기준 승률(0~100 정수, 0판이면 0). 통신규약 시트는 player1/player2(세션 순서) + win
+// (승자 userid) 형태였으나, 2026-10-01 사용자 지시로 승자/패자 기준의 winner/loser 로 바뀌었다(문서는
+// 아직 갱신 전 — 이 CLAUDE.md/타입이 최신 기준).
+export interface GameResultPlayerInfo {
+    userid: string;
+    win_count: number;
+    win_per: number;
+}
+
+// GAME_RESULT — 최종 결과 (S→C). 승자 userid 는 winner.userid 로 알 수 있어 별도 win 필드는 없다.
 // 점수(2:0=20점/2:1=10점) 는 클라이언트에 보내지 않는다 — DB/랭킹에만 쓰는 값이라 문서에도 없다.
+// ⚠️ win_per 은 이번 게임 결과가 반영된 값이다 — DB 저장(SaveGameResult) 완료를 기다리지 않고 메모리에
+// 있는 현재 값(this.players, 재게임 전까지는 지난 게임까지의 DB 값)에 "이번 판 결과"를 더해 즉시
+// 계산한다(결과 화면이 DB 왕복 시간만큼 늦어지지 않게 하는 기존 설계 원칙 유지 — GameRoom.FinishGame 참고).
 export interface GameResultPayload {
-    player1: number;
-    player2: number;
-    win: string;
+    winner: GameResultPlayerInfo;
+    loser: GameResultPlayerInfo;
 }
 
 // GAME_RESULT 로 클라이언트가 보내는 값 (재시작 선택, 같은 type 재사용). 문서에는 "replay:Y" 만 있고

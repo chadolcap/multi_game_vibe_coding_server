@@ -35,18 +35,20 @@ import {
 } from "../../common/types.js";
 import { RegisterRoom, UnregisterRoom } from "../../common/roomRegistry.js";
 import { SaveGameResult, type PlayRecord } from "../../db/gameResultRepository.js";
+import { GetUserCache, TouchUserCache } from "../../db/userCache.js";
 import { RemoveActiveGame, SaveActiveGame } from "./activeGame.js";
 import { PushWaitingRoom, RemoveWaitingRoom } from "./waitingRooms.js";
 import type { ActiveGameEntry, WaitingRoomEntry } from "./types.js";
 
 // total_win_count / total_game_count 기준 승률 (0~100 정수). 한 판도 안 한 유저는 0.
-function ComputeWinPer(user: UserInfo): number {
-    if (user.total_game_count === 0) return 0;
-    return Math.round((user.total_win_count / user.total_game_count) * 100);
+// 숫자 두 개를 직접 받는 형태라, FinishGame 에서 "이번 판 결과를 더한 예상값"도 그대로 계산할 수 있다.
+function ComputeWinPer(total_win_count: number, total_game_count: number): number {
+    if (total_game_count === 0) return 0;
+    return Math.round((total_win_count / total_game_count) * 100);
 }
 
 function ToRoomPlayerInfo(user: UserInfo): RoomPlayerInfo {
-    return { userid: user.userid, name: user.name, avatar: user.avatar, win_per: ComputeWinPer(user) };
+    return { userid: user.userid, name: user.name, avatar: user.avatar, win_per: ComputeWinPer(user.total_win_count, user.total_game_count) };
 }
 
 // a 가 b 를 이기면 true (가위>보, 바위>가위, 보>바위)
@@ -240,6 +242,14 @@ export class GameRoom extends Room {
             RemoveActiveGame(left_user.userid).catch((error) => {
                 console.error(`[GameRoom] RemoveActiveGame 실패 roomId=${this.roomId}:`, error instanceof Error ? error.message : error);
             });
+            // 게임방을 떠날 때도 로비와 같은 규칙(CLAUDE.md 흐름 13번)을 따른다 — 값을 새로 쓰지 않고
+            // TTL 만 다시 설정한다. 게임 결과가 막 저장돼 캐시가 이미 최신(FinishGame → RefreshUserCache)
+            // 이어도 TTL 을 다시 거는 건 안전하다(idempotent).
+            GetUserCache(left_user.userid)
+                .then((cached) => (cached ? TouchUserCache(cached) : undefined))
+                .catch((error) => {
+                    console.error(`[GameRoom] TouchUserCache 실패 roomId=${this.roomId}:`, error instanceof Error ? error.message : error);
+                });
         }
 
         if (this.waiting_room_entry && client.sessionId === this.waiting_session) {
@@ -522,7 +532,23 @@ export class GameRoom extends Room {
         const winner_is_bot = this.bot_sessions.has(winner_session);
         const loser_is_bot = this.bot_sessions.has(loser_session);
 
-        const payload: GameResultPayload = { player1: count_a, player2: count_b, win: winner_user.userid };
+        // win_per 은 이번 판 결과가 반영된 값이다 — DB 저장(SaveGameResult) 완료를 기다리지 않고, 메모리에
+        // 있는 현재 값(this.players, 아직 DB 반영 전이므로 지난 게임까지의 값)에 "이번 판 결과"를 더해
+        // 즉시 계산한다(결과 화면이 DB 왕복 시간만큼 늦어지지 않게 하는 기존 설계 원칙 유지).
+        const winner_count = this.win_count_by_session.get(winner_session) ?? 0;
+        const loser_count = this.win_count_by_session.get(loser_session) ?? 0;
+        const payload: GameResultPayload = {
+            winner: {
+                userid: winner_user.userid,
+                win_count: winner_count,
+                win_per: ComputeWinPer(winner_user.total_win_count + 1, winner_user.total_game_count + 1),
+            },
+            loser: {
+                userid: loser_user.userid,
+                win_count: loser_count,
+                win_per: ComputeWinPer(loser_user.total_win_count, loser_user.total_game_count + 1),
+            },
+        };
         for (const client of this.clients) {
             SendMessage(this, client, MessageType.GAME_RESULT, payload);
         }
@@ -536,7 +562,7 @@ export class GameRoom extends Room {
             const result = await SaveGameResult({
                 winner_userid: winner_user.userid,
                 loser_userid: loser_user.userid,
-                loser_win_count: Math.min(count_a, count_b),
+                loser_win_count: loser_count,
                 start_time: this.game_started_at ?? new Date(),
                 end_time: new Date(),
                 // 스냅샷(복사본)을 넘긴다 — 이 DB 저장이 끝나기 전에 재게임으로 StartGame() 이 다시 불리면

@@ -1,7 +1,7 @@
-// user_partner_info + user_member_info + user_play_info 조회 (CachedUserInfo)
+// user_partner_info + user_member_info + user_play_info 조회 (DbUserInfo, phone 포함)
 
 import type { Pool, RowDataPacket } from "mysql2/promise";
-import type { CachedUserInfo } from "../types.js";
+import type { DbUserInfo } from "../types.js";
 
 interface UserInfoRow extends RowDataPacket {
     userid: string;
@@ -20,7 +20,7 @@ interface UserInfoRow extends RowDataPacket {
 // DB 의 실제 값은 그대로 두고, 다음에 이 유저가 게임을 하면 UpdatePlayInfoAfterGame 이 실제로 리셋한다
 // (Phase 8, TASKS.md "자정에 today_game_count, today_win_count 초기화" 참고).
 // ⚠️ IF(...) 표현식으로 감싼 컬럼은 mysql2 가 원래 컬럼(INT UNSIGNED)과 다르게 문자열로 반환하는 걸
-// 실제로 겪었다 — CAST(... AS UNSIGNED) 로 타입을 명시해야 CachedUserInfo.today_game_count(number)
+// 실제로 겪었다 — CAST(... AS UNSIGNED) 로 타입을 명시해야 DbUserInfo.today_game_count(number)
 // 와 실제로 맞는 타입이 온다.
 const SELECT_USER_INFO_SQL = `
     SELECT
@@ -40,7 +40,7 @@ const SELECT_USER_INFO_SQL = `
     LIMIT 1
 `;
 
-export async function FetchUserInfo(pool: Pool, userid: string): Promise<CachedUserInfo | null> {
+export async function FetchUserInfo(pool: Pool, userid: string): Promise<DbUserInfo | null> {
     const [rows] = await pool.query<UserInfoRow[]>(SELECT_USER_INFO_SQL, [userid]);
     if (rows.length === 0) return null;
 

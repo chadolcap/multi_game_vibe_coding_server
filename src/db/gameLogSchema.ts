@@ -1,5 +1,6 @@
 // game_log_YYYY_MM — 월별 게임 로그 테이블. 이름이 매달 바뀌므로 schema.sql 이 아니라 여기서 동적으로 만든다.
-// - score: 승자 기준 "2:0" / "2:1" 문자열
+// - vs: 승자 기준 "2:0" / "2:1" 문자열 (2026-10-01 전: 이 자리가 "score" 컬럼이었다 — 이름만 바뀜)
+// - score: 이번 판에서 승자가 실제로 획득한 점수(2:0=20점/2:1=10점, SCORE_WIN_STRAIGHT/SCORE_WIN_NORMAL)
 // - plays: 무승부 판까지 포함한 모든 판을 순서대로 담은 JSON 배열
 //   예: [{"win":"R","lose":"S"},{"draw":"P"},{"win":"S","lose":"P"}]
 // - win_is_bot / lose_is_bot: 승자/패자가 봇이 대신 플레이했는지
@@ -22,7 +23,8 @@ function GetCreateTableSql(table_name: string): string {
             end_time      DATETIME        NOT NULL,
             win           VARCHAR(255)    NOT NULL,
             lose          VARCHAR(255)    NOT NULL,
-            score         VARCHAR(3)      NOT NULL,
+            vs            VARCHAR(3)      NOT NULL,
+            score         INT UNSIGNED    NOT NULL DEFAULT 0,
             plays         JSON            NOT NULL,
             win_is_bot    TINYINT(1)      NOT NULL DEFAULT 0,
             lose_is_bot   TINYINT(1)      NOT NULL DEFAULT 0,

@@ -20,17 +20,24 @@ import {
     type MatchFoundPayload,
     type NamePayload,
     type PlayInfoResultPayload,
-    type RankInfoPayload,
-    type RankInfoResultPayload,
+    type RankDailyResultPayload,
+    type RankListEntry,
+    type RankWeeklyResultPayload,
     type RejoinGamePayload,
     type UserInfo,
 } from "../../common/types.js";
 import { IsValidGender, IsValidMid, IsValidPartner, IsValidPhone, ConvertMidToUserid } from "../../common/userid.js";
 import { GetOrCreateUser, SetUserName } from "../../db/userRepository.js";
 import { GetUserCache, TouchUserCache } from "../../db/userCache.js";
-import { FetchRankInfo } from "../../db/rankingRepository.js";
+import { FetchRankDaily, FetchRankWeekly } from "../../db/rankingRepository.js";
+import type { RankEntry } from "../../db/types.js";
 import { GetActiveGame, RemoveActiveGame } from "../room/activeGame.js";
 import { RoomManager, ToPublicOpponentInfo } from "../room/RoomManager.js";
+
+// RankEntry(DB 조회 결과, { rank, userid, name, score }) → 문서 payload 형식인 [name, score] 튜플로 변환
+function ToRankListEntries(entries: RankEntry[]): RankListEntry[] {
+    return entries.map((entry): RankListEntry => [entry.name, entry.score]);
+}
 
 function IsEnterLobbyShape(payload: unknown): payload is EnterLobbyPayload {
     if (typeof payload !== "object" || payload === null) return false;
@@ -76,8 +83,10 @@ export class LobbyManager {
     // (Room 이 10초 타임아웃 타이머를 지워야 함).
     public async HandleEnterLobby(client: Client, raw_message: unknown): Promise<boolean> {
         if (this.userid_by_session.has(client.sessionId)) {
-            // 이미 입장한 연결이 또 보낸 경우 — 연결은 유지하고 실패로만 알린다 (중복 접속)
+            // 이미 입장한 연결이 또 보낸 경우 — 다른 중복 접속 경로(아래)와 똑같이 연결을 끊는다
+            // (2026-10-01 정정: 예전엔 연결을 유지했는데, 사용자 지시로 일관되게 바꿨다)
             SendResult(this.room, client, MessageType.ENTER_LOBBY, "N", EnterLobbyErrorCode.DUPLICATE_CONNECTION);
+            client.leave(CloseCode.WITH_ERROR);
             return false;
         }
 
@@ -234,22 +243,33 @@ export class LobbyManager {
         SendMessage(this.room, client, MessageType.PLAY_INFO, payload);
     }
 
-    // RANK_INFO 처리 (Phase 8). PLAY_INFO 와 같은 패턴으로 실패 케이스가 없다 — ENTER_LOBBY 를 아직
-    // 안 했거나 형식이 잘못된 요청(period 가 daily/weekly 가 아님)은 조용히 무시한다.
-    public async HandleRankInfo(client: Client, message: RankInfoPayload): Promise<void> {
+    // RANK_DAILY/RANK_WEEKLY 처리 (Phase 8, 2026-10-01 통신규약 시트 기준). PLAY_INFO 와 같은 패턴으로
+    // 실패 케이스가 없다 — ENTER_LOBBY 를 아직 안 했으면 조용히 무시한다. DB 조회 결과(RankEntry[])를
+    // 문서 payload 형식인 [name, score] 튜플 배열로 변환해서 보낸다.
+    public async HandleRankDaily(client: Client): Promise<void> {
         const userid = this.userid_by_session.get(client.sessionId);
         if (!userid) return;
-        if (message?.period !== "daily" && message?.period !== "weekly") return;
 
-        const { rank_list, my_rank, my_score } = await FetchRankInfo(message.period, userid);
-        const payload: RankInfoResultPayload = {
-            result: "Y",
-            period: message.period,
-            rank_list,
-            my_rank,
-            my_score,
+        const { date, rank_list, my_rank, my_score } = await FetchRankDaily(userid);
+        const payload: RankDailyResultPayload = {
+            date,
+            list: ToRankListEntries(rank_list),
+            my: { rank: my_rank, score: my_score },
         };
-        SendMessage(this.room, client, MessageType.RANK_INFO, payload);
+        SendMessage(this.room, client, MessageType.RANK_DAILY, payload);
+    }
+
+    public async HandleRankWeekly(client: Client): Promise<void> {
+        const userid = this.userid_by_session.get(client.sessionId);
+        if (!userid) return;
+
+        const { term, rank_list, my_rank, my_score } = await FetchRankWeekly(userid);
+        const payload: RankWeeklyResultPayload = {
+            term,
+            list: ToRankListEntries(rank_list),
+            my: { rank: my_rank, score: my_score },
+        };
+        SendMessage(this.room, client, MessageType.RANK_WEEKLY, payload);
     }
 
     // 연결이 끊겼을 때 (ENTER_LOBBY 이전에 끊겼으면 등록된 게 없어 아무 일도 하지 않는다)

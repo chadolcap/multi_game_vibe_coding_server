@@ -35,9 +35,15 @@ export const SCORE_LOSE = 0;
 // ── 캐시 / 랭킹 ──
 export const USER_CACHE_TTL_SEC = 120;          // Redis 유저 정보 TTL (2분)
 export const RANKING_LIST_SIZE = 100;           // 랭킹 노출 1~100위
-// 1~100위 목록은 모든 유저에게 같은 값이라 Redis 에 짧게 캐시해 DB 부하를 줄인다(본인 순위는 유저마다
-// 달라 캐시하지 않는다 — db/rankingRepository.ts 참고).
+// 랭킹 순위/점수 자체는 Redis Sorted Set(rank_zset:*, db/rankingZSet.ts)에서 O(log N)으로 조회하므로
+// 더 이상 캐시가 필요 없다(2026-10-01, 사용자 요청으로 MySQL RANK() 윈도우 함수 방식에서 전환).
+// 이 캐시는 "상위 100명의 userid 목록에 이름을 붙인 최종 리스트"(이름 조인에 MySQL 쿼리가 필요한
+// 부분)만 짧게 캐시해 DB 부하를 줄인다 — db/rankingRepository.ts 참고.
 export const RANK_LIST_CACHE_TTL_SEC = 10;
+// Redis Sorted Set(rank_zset:daily:{date}/rank_zset:weekly:{monday})의 TTL. 그 날/그 주가 끝난 뒤에도
+// 한동안은 재구축 없이 바로 조회되게 여유를 둔다 — 진짜 원본은 MySQL(rank_daily/rank_weekly)이므로
+// 이 TTL 이 지나 ZSET 이 사라져도 다음 조회 때 자동으로 다시 채워진다(db/rankingZSet.ts 참고).
+export const RANK_ZSET_TTL_SEC = 3 * 24 * 60 * 60; // 3일
 
 // 게임 중인 userid → 게임방 정보(방 재접속용) 기록의 Redis TTL. 정상적으로는 onLeave 에서 즉시 지우므로
 // 이 TTL 은 프로세스가 죽는 등 onLeave 가 아예 안 불리는 드문 경우를 대비한 안전망일 뿐이다 — 실제 게임

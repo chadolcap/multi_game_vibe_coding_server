@@ -33,12 +33,17 @@ CREATE TABLE IF NOT EXISTS user_member_info (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 유저의 게임 play 정보. score_max 는 두지 않는다 (점수는 rank_daily / rank_weekly 에서 관리).
+-- total_score/today_score 는 한 판에서 획득한 점수(game_log.score 와 같은 값)를 그대로 누적한 값이다
+-- (2026-10-01 추가) — rank_daily/rank_weekly 와는 별개로, "이 유저가 지금까지/오늘 번 점수 총합"을
+-- user_play_info 에도 바로 보여줄 수 있게 둔다.
 CREATE TABLE IF NOT EXISTS user_play_info (
     userid             VARCHAR(255)     NOT NULL,
     total_game_count   INT UNSIGNED     NOT NULL DEFAULT 0,
     total_win_count    INT UNSIGNED     NOT NULL DEFAULT 0,
+    total_score        INT UNSIGNED     NOT NULL DEFAULT 0,
     today_game_count   INT UNSIGNED     NOT NULL DEFAULT 0,
     today_win_count    INT UNSIGNED     NOT NULL DEFAULT 0,
+    today_score        INT UNSIGNED     NOT NULL DEFAULT 0,
     today_date         DATE             NOT NULL,           -- today_* 가 어느 날짜 기준인지. 오늘과 다르면
                                                               -- 조회 시(queries/userInfo.ts) 0 으로 보정해서
                                                               -- 보여주고, 다음 게임 결과 반영 시(queries/

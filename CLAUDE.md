@@ -147,7 +147,7 @@ src/
     WatcherManager.ts         ADMIN_LOGIN 인증 + ADMIN_CHANNEL_COUNT/USER 조회 + SEND_NOTICE 전파 — 아래 설명 참고
   game/
     lobby/
-      LobbyManager.ts         ENTER_LOBBY/NAME/PLAY_INFO/RANK_INFO/JOIN_MATCH 처리 + REJOIN_GAME 안내 — 아래 설명 참고
+      LobbyManager.ts         ENTER_LOBBY/NAME/PLAY_INFO/RANK_DAILY/RANK_WEEKLY/JOIN_MATCH 처리 + REJOIN_GAME 안내 — 아래 설명 참고
       LobbyRoom.ts            소켓 이벤트를 LobbyManager 에 위임, ENTER_TIMEOUT/CHANNEL_FULL 검사
     room/
       RoomManager.ts          매칭/방 생성/"기다리는 방"/재접속 확인 — 아래 설명 참고
@@ -161,10 +161,11 @@ src/
     channelHeartbeat.ts       채널 생존/담당 프로세스 표시 + 방 생성 라우팅 보정 — 아래 설명 참고
     noticePubSub.ts           SEND_NOTICE → Redis Pub/Sub → 로비/게임 채널 전파 — 아래 설명 참고
     channelUsers.ts           채널별 접속자 목록을 Redis 에 주기적 리포트 (ADMIN_CHANNEL_USER 조회용)
-    userCache.ts              유저 정보 Redis 캐시 (user:info:{userid}, TTL 120초)
+    userCache.ts              유저 정보 Redis 캐시 (user:info:{userid}, TTL 120초, phone 은 저장 안 함)
     userRepository.ts         유저 조회 진입점(Redis → DB 순) — 매니저는 이 모듈만 호출
     gameResultRepository.ts   게임 결과 DB/Redis 반영 진입점 — 아래 설명 참고
-    rankingRepository.ts      랭킹 조회 진입점 — Top 100 목록만 Redis 로 짧게 캐시(10초) — 아래 설명 참고
+    rankingRepository.ts      랭킹 조회 진입점(이름 붙이기 + 날짜 포맷) — 아래 설명 참고
+    rankingZSet.ts            랭킹 순위/점수의 Redis Sorted Set 관리 (ZINCRBY/ZSCORE/ZCOUNT) — 아래 설명 참고
     types.ts                  DB/Redis 전용 타입 (CachedUserInfo → ToPublicUserInfo() → UserInfo 변환)
     schema.sql                테이블 스키마 (game_log_YYYY_MM 은 이름이 매달 바뀌어 여기 없음)
     gameLogSchema.ts          game_log_YYYY_MM 동적 생성 (GetGameLogTableName, EnsureGameLogTable)
@@ -240,6 +241,20 @@ scripts/
 채널은 `db/channelHeartbeat.ts` 의 `GetAliveGameChannels()` 로 "지금 켜져 있는 채널"만 골라서 시도한다.
 `TryReconnectToGame()` 으로 `activeGame.ts` 기록이 아직 유효한지도 확인한다(F5 재접속).
 
+> ⚠️ **부하 테스트로 발견한 매칭 폭주 취약점 (Phase 9, 2026-10-01)**: `LobbyManager.TryMatch()` 가
+> 매칭 쌍을 `while` 루프로 **한 쌍씩 순차 처리**한다 — 101쌍(202명)이 **완전히 동시에** `JOIN_MATCH`
+> 를 보내면, 뒤 순번 쌍은 처리 순서를 기다리다 좌석 예약 10초(`SEAT_RESERVATION_SEC`) 제한을 넘겨버려
+> 좌석을 소비하고도 상대가 안 들어온 것으로 처리돼 `CheckSeatFillTimeout` 에 걸려 쫓겨났다(실측:
+> 87명이 `RETURN_TO_LOBBY` 로 쫓겨나고 10명만 성공). 반면 같은 202명을 **10초에 걸쳐 분산** 접속시키면
+> 쫓겨나는 유저가 0명이었다 — "완전 동시 폭주"일 때만 문제가 되는 취약점이다. 심각도가 낮다고 판단해
+> 이번엔 구조를 고치지 않고 발견 사실만 남긴다(TASKS.md Phase 9 참고) — 필요해지면 `TryMatch()` 의
+> 순차 처리를 병렬화하거나 `SEAT_RESERVATION_SEC` 를 늘리는 방향을 검토할 것.
+>
+> 또한 100번째 방 경계에서 매칭 쌍 2개가 거의 동시에 도착하면 `matchMaker.query().length >=
+> MAX_ROOMS_PER_GAME_CHANNEL` 체크를 **둘 다 통과 못 하는** 레이스 컨디션도 관찰했다(200명을 기대했는데
+> 198명만 성공). 방이 100개보다 많이 생기는 쪽이 아니라 적게 생기는 쪽으로 실패해 데이터 무결성 문제는
+> 없다 — 경계에서 약간의 용량 손실만 있다.
+
 **`game/room/GameRoom.ts`** — 실제 게임룰이 진행되는 모듈(2인이 게임하는 로직. 게임방이 100개면 이 클래스가
 100개 생성됨). 종료 시 Lobby 로 복귀. 구현된 내용:
 - 잠금(lock) + 좌석 예약 유저 정보 저장 + 10초 안에 2명 안 모이면 정리
@@ -258,7 +273,15 @@ scripts/
   (Phase 6-1, "재접속/봇 대체" 참고)
 - F5 등으로 로비를 거쳐 돌아온 유저를 위한 `activeGame.ts` 기록(`onJoin`/`onReconnect` 마다 저장, `onLeave`
   에서 삭제 — "F5 재접속" 참고)
-- 아직 미구현: `today_date` 자정 롤오버(`schema.sql` 참고, Phase 8)
+- `onLeave` 에서 `GetUserCache`→`TouchUserCache` 로 Redis TTL 갱신(CLAUDE.md 흐름 13번: "로비/게임방을
+  떠날 때는 값을 새로 쓰지 않고 TTL 만 다시 설정"). ⚠️ **실제로 겪은 누락**: `LobbyManager.HandleLeave`
+  에는 처음부터 있었는데 `GameRoom.onLeave` 에는 빠져 있었다 — 게임방을 떠난 유저의 캐시가 TTL(120초)
+  이내에 만료되면 다음 로비 재접속 때 DB 를 다시 조회하는 비효율만 있었을 뿐 기능 버그는 아니었지만,
+  2026-10-01 TASKS.md 완료 확인 재점검 중 발견해서 로비와 같은 패턴으로 추가했다. 실제 게임 진행(2:0
+  승부 → `GAME_RESULT` → 둘 다 나가기) 후 `onLeave` 직후 캐시 TTL 이 다시 걸리는 것까지 확인함(TASKS.md
+  Phase 5 "완료 확인" 참고).
+- `today_date` 자정 롤오버는 Phase 8 에서 "지연 초기화" 방식으로 구현 완료(`queries/userInfo.ts`/
+  `queries/gameResult.ts` `UpdatePlayInfoAfterGame` — 위 "자정 롤오버" 섹션 참고)
 
 **`game/room/activeGame.ts`** — "userid → 게임 중인 방" 기록(Redis, `active_game:{userid}` 키, Phase 6-1).
 로비가 `ENTER_LOBBY` 때 이 값으로 `REJOIN_GAME` 안내 여부를 판단한다("F5 재접속" 참고).
@@ -274,12 +297,44 @@ Colyseus 기본 라우팅이 룸 타입을 안 보고 로드만 보는 문제를
 `user_play_info`/랭킹/`game_log` 저장 + Redis 캐시 write-through 까지 처리한다. `GameRoom` 은 이 모듈만
 호출한다.
 
-**`db/rankingRepository.ts` / `db/queries/ranking.ts`** — 랭킹 조회(Phase 8). `GetRankList()` 로
-1~`RANKING_LIST_SIZE`(100)위, `GetMyRank()` 로 본인 순위/점수를 가져온다. 둘 다 `RANK()` 윈도우 함수로
-동점자를 같은 순위로 처리한다(MariaDB 10.4 지원 확인). 본인이 그 기간(오늘/이번 주)에 아직 기록이
-없으면 0점 취급하고 "0점보다 높은 사람 수 + 1"로 순위를 매긴다 — 100위 밖이든 기록이 아예 없든 항상
-값이 온다. Top 100 목록은 모든 유저에게 같은 값이라 `RANK_LIST_CACHE_TTL_SEC`(10초) 동안 Redis 에 캐시
-하고, 본인 순위는 유저마다 달라 캐시하지 않는다(단순 인덱스 스캔이라 부하가 낮음).
+**`db/rankingZSet.ts`** — 랭킹 순위/점수를 Redis Sorted Set 으로 관리한다(Phase 8, **2026-10-01 사용자
+요청으로 전환** — 아래 "랭킹 조회 성능" 참고). 키는 `rank_zset:daily:{YYYY-MM-DD}` /
+`rank_zset:weekly:{그 주 월요일}` — 날짜가 바뀌면 자동으로 새 키(빈 ZSET)가 되므로 자정 롤오버가
+MySQL(날짜별 PK)과 똑같이 저절로 처리된다.
+- `IncrementRankScore(period, userid, score)` — 게임 결과 반영 시 `queries/gameResult.ts` `AddRankScore`
+  (MySQL)와 **함께**(이중 쓰기) 호출한다. `ZINCRBY` + 매번 `EXPIRE` 갱신(sliding TTL,
+  `RANK_ZSET_TTL_SEC`=3일). 패자도 0점으로 `ZINCRBY` 해서 "오늘 참여했다"는 멤버 자체는 남겨 둔다.
+- `GetTopRankEntries(pool, period)` — `ZREVRANGE 0 (RANKING_LIST_SIZE-1) WITHSCORES` 로 (userid, score)만
+  가져온다. 이름은 안 붙인다(아래 `rankingRepository.ts` 참고).
+- `GetMyRankFromZSet(pool, period, userid)` — `ZSCORE`(본인 점수, 없으면 0) + `ZCOUNT key (내점수 +inf)`
+  (본인보다 점수가 높은 멤버 수) + 1. **`ZREVRANK` 가 아니라 `ZCOUNT` 를 쓴 이유**: `ZREVRANK` 는 동점자도
+  서로 다른 순위를 매기는데, 이 프로젝트는 "내 점수보다 높은 사람 수 + 1"(동점자 공동 순위, TASKS.md
+  Phase 8)을 요구사항으로 못박아 뒀다 — `ZCOUNT` 로 그 정의를 그대로 구현한다. 두 명령 다 O(log N)이다.
+- **MySQL 이 여전히 원본(source of truth)** — ZSET 이 비어있으면(최초 조회, Redis 재시작 등)
+  `EnsureZSet()` 이 `queries/ranking.ts` `GetAllRankRows()` 로 그 기간 전체를 읽어 `ZADD` 로 다시 채운다.
+  평소 흐름에서는 `ZINCRBY` 가 이미 키를 만들어 두므로 거의 호출될 일이 없다.
+
+**`db/rankingRepository.ts` / `db/queries/ranking.ts`** — 랭킹 조회(Phase 8) 진입점. `rankingZSet.ts` 가
+돌려주는 (userid, score) 목록에 `queries/ranking.ts` `GetNamesByUserids()`(MySQL `IN` 쿼리 한 번)로
+이름을 붙이고, 그 **이름 붙인 최종 목록만** `RANK_LIST_CACHE_TTL_SEC`(10초) 동안 Redis 에 캐시한다(순위
+계산 자체는 이제 캐시 없이도 충분히 빠르다 — 아래 참고). 본인이 그 기간(오늘/이번 주)에 아직 기록이
+없으면 `GetMyRankFromZSet` 이 0점 취급해서 순위를 매긴다 — 100위 밖이든 기록이 아예 없든 항상 값이 온다.
+
+### 랭킹 조회 성능 — RANK() 윈도우 함수에서 Redis Sorted Set 으로 (2026-10-01)
+
+**문제**: 처음엔 `RANK_DAILY`/`RANK_WEEKLY` 를 MySQL `RANK() OVER (ORDER BY score DESC)` 윈도우 함수로
+구현했다. Top 100 목록은 Redis 로 캐시해 괜찮았지만, **본인 순위 조회(`GetMyRank`)는 캐시하지 않았고**,
+그 쿼리 자체가 "본인 1명의 순위"를 구하기 위해 **그 기간(오늘/이번 주) 전체 로우를 다 정렬**해야 하는
+구조였다 — `schema.sql` 의 `idx_rank_daily_score(date_game, score)` 인덱스가 있어도 이 쿼리 형태로는
+활용되기 어려웠다. 사용자가 "요청마다 매번 SELECT 하면 사용자가 많을 때 부하 우려가 있지 않냐"고
+지적해서 확인했고, 실제로 하루 활성 유저가 많아질수록 `RANK_DAILY`/`RANK_WEEKLY` 요청이 몰릴 때 이 전체
+정렬 비용이 반복된다는 게 맞았다.
+
+**해결**: 사용자가 예전에 써 본 방식이라며 Redis Sorted Set 전환을 요청했다. `db/rankingZSet.ts` 로
+옮기면서 `ZSCORE`/`ZCOUNT` 둘 다 O(log N) 이 되어, 동시 조회가 몰려도 비용이 거의 안 늘어난다. MySQL
+(`rank_daily`/`rank_weekly`)은 원본으로 그대로 두고(게임 결과 반영 시 이중 쓰기), Redis 는 "그 원본을
+빠르게 조회하기 위한 인덱스" 역할만 하도록 설계했다 — Redis 데이터가 날아가도(재시작 등) MySQL 에서
+자동 재구축되므로 데이터 유실 위험은 없다.
 
 **자정 롤오버(Phase 8)** — `today_game_count`/`today_win_count` 를 매일 자정에 0 으로 되돌리는 문제를
 "지연 초기화"로 푼다: 실제 DB 값은 그대로 두고, (1) 조회 시(`queries/userInfo.ts`
@@ -334,7 +389,12 @@ Colyseus 기본 라우팅이 룸 타입을 안 보고 로드만 보는 문제를
 10. redis 에 저장한 정본느 2분 후 소멸 시킨다.
 11. 첫 접속 유저(DB 에 없음)는 로비 진입 시 user_partner_info / user_member_info / user_play_info 에 새로 만든다.
   (name, avatar 는 빈 값. 여러 번/동시에 호출돼도 한 번만 만들어진다)
-12. 같은 userid 가 이미 로비 대기 중이거나 게임 중이면 새 접속을 거부한다 (ALREADY_CONNECTED). 다른 채널과의 중복은 아직 막지 않는다.
+12. 같은 userid 가 이미 **이 채널 로비에 대기 중**이면 새 접속을 거부한다 — 별도 메시지 타입이 아니라
+   `ENTER_LOBBY` 요청과 같은 type 으로 `{result:"N", error:2}`(중복 접속, "ENTER_LOBBY / NAME 결과
+   코드" 표 참고)를 응답한다(예전엔 `ALREADY_CONNECTED` 라는 별도 메시지로 잘못 적혀 있었다 —
+   2026-10-01 정정, `LobbyManager.HandleEnterLobby` 참고). **같은 userid 가 게임 중**이면 거부가 아니라
+   `REJOIN_GAME` 을 보내 원래 게임방으로 재접속시킨다(Phase 6-1, "F5 재접속" 참고) — 거부와는 다른
+   처리다. 다른 채널과의 중복은 아직 막지 않는다.
 13. 유저가 로비/게임방을 떠날 때는 Redis 값을 새로 쓰지 않고 TTL(120초)만 다시 설정한다. (키가 이미 만료됐으면 메모리의 값으로 다시 저장)
   매칭되어 게임방으로 가는 경우의 유저 정보는 좌석 예약으로 전달되므로 Redis 에 의존하지 않는다.
 
@@ -345,8 +405,16 @@ Colyseus 기본 라우팅이 룸 타입을 안 보고 로드만 보는 문제를
 1. 클라이언트에서 받은 partner, mid, gender, phone 중 partner, mid 로 user_partner_info 테이블을 검색하여, userid 를 얻는다.
   - gender 는 user_partner_info, phone 은 user_member_info 에 저장한다.
   - gender: `F` 또는 `M` 만 허용. phone: **빈 값 불가**, 텍스트 최대 100자 (DB VARCHAR(100)). 형식이 틀리면 `INVALID_ID`.
-  - 기존 유저가 저장된 값과 다른 phone 을 보내면 user_member_info.phone 을 **새 값으로 갱신**하고, Redis 캐시도 함께 갱신한다.
-  - phone 은 개인정보다. 다른 유저에게 보내지 않고, 좌석 예약·로그·Redis 공유 정보에 넣지 않는다.
+  - 기존 유저가 저장된 값과 다른 phone 을 보내면 user_member_info.phone 을 **새 값으로 갱신**한다 —
+    단, **Redis 캐시(`user:info:{userid}`)에 phone 자체가 없으므로** 이 비교/갱신은 DB 를 다시 조회할
+    때(캐시 미스)만 일어난다. 캐시가 살아있는 동안(최대 `USER_CACHE_TTL_SEC`=120초) 재접속하면 phone
+    이 달라도 그냥 캐시된 값을 쓰고 갱신을 건너뛴다(2026-10-01 사용자 결정 — phone 은 "추후 유저 성향
+    등 통계에만 쓰이는" 정보라 즉시성보다 캐시 적중률을 우선함, `db/userRepository.ts` `GetOrCreateUser` 참고).
+  - phone 은 개인정보다. 다른 유저에게 보내지 않고, 좌석 예약·로그·**Redis 공유 정보에 넣지 않는다**
+    (⚠️ 이 원칙이 처음엔 코드에 실제로 지켜지지 않았다 — `db/types.ts` 의 `CachedUserInfo` 타입이 phone
+    을 포함한 채로 그대로 Redis 캐시에도 저장되고 있었다. 2026-10-01 사용자 지적으로 DB 조회 전용
+    `DbUserInfo`(phone 포함, `db/queries/userInfo.ts` `FetchUserInfo` 의 반환 타입)와 Redis 캐시(phone
+    없는 `UserInfo` 그대로, `db/userCache.ts`)를 분리해서 실제로 맞췄다).
 2. 만약 user_partner_info 테이블에 정보가 없다면, 받은 정보를 토태로 user_partner_info, user_member_info, user_play_info 테이블에 기본 정보를 insert 한 후 서버로 리턴 한다.
 3. user_partner_info 에 존재하는 유저일 경우 user_member_info, user_play_info 테이블의 정보를 가져온다.
 4. 가져온 정보를 토태로 클라이언트에 해당 유저의 상태를 알려준다. 새로운 유저 or 기존 유저 에 따른 '별명', '인증요청' 등 추가 정보 처리를 진행하게 한다.
@@ -400,11 +468,19 @@ Colyseus 기본 라우팅이 룸 타입을 안 보고 로드만 보는 문제를
 
 - user_partner_info(파트너사의 유저 기본 정보) : userid(PK), partner, mid, gender, created_at / UNIQUE(partner, mid)
 - user_member_info(유저의 기본 정보) : userid(PK, FK→user_partner_info), name(NULL=별명 미등록, UNIQUE — 앱에서는 빈 문자열로 다룬다), avatar, phone(VARCHAR(100)), join_date, login_date, certification_date(본인 인증 날짜), terms_date(약관인증 동의 날짜)
-- user_play_info(유저의 게임 play 정보) : userid(PK, FK→user_partner_info), total_game_count, total_win_count, today_game_count, today_win_count, today_date (score_max 는 두지 않는다 — 점수는 rank_daily/rank_weekly 에서만 관리)
-- game_log_2026_09(게임 로그 정보, 월별) : start_time, end_time, win(승자 userid), lose(패자 userid), score, plays, win_is_bot, lose_is_bot
+- user_play_info(유저의 게임 play 정보) : userid(PK, FK→user_partner_info), total_game_count, total_win_count,
+  **total_score**, today_game_count, today_win_count, **today_score**, today_date (score_max 는 두지 않는다 —
+  rank_daily/rank_weekly 와 별개로, "지금까지/오늘 번 점수 총합"을 바로 보여줄 수 있게 2026-10-01 추가)
+  - total_score/today_score 는 한 판(game_log.score 와 같은 값)이 끝날 때마다 승자에게만 더해진다(패자는 0점이라
+    더해도 그대로) — `queries/gameResult.ts` `UpdatePlayInfoAfterGame`. today_score 도 today_game_count 와
+    같은 자정 롤오버(지연 초기화) 규칙을 따른다.
+- game_log_2026_09(게임 로그 정보, 월별) : start_time, end_time, win(승자 userid), lose(패자 userid), **vs**, **score**, plays, win_is_bot, lose_is_bot
   - 테이블 이름이 매달 바뀌므로 schema.sql 에 없다. `src/db/gameLogSchema.ts` 의 `EnsureGameLogTable()` 이 필요할 때 동적으로 만든다 (`db:init` 이 이번 달 것을 미리 만들어 둠)
   - 승자/패자 각각 **게임이 끝날 때 유저가 직접 했는지, 봇이 했는지** 기록한다 (win_is_bot, lose_is_bot)
-  - 최종 스코어는 승자 기준 `"2:0"` / `"2:1"` 문자열로 score 컬럼에 저장한다. 판별 가위바위보 값도 계속 기록한다.
+  - **`vs`**: 승자 기준 `"2:0"` / `"2:1"` 문자열 (2026-10-01 전에는 이 자리가 `score` 컬럼이었다 — 이름만
+    바뀜). **`score`**(신규): 이번 판에서 승자가 실제로 획득한 점수(20점/10점, `SCORE_WIN_STRAIGHT`/
+    `SCORE_WIN_NORMAL`) — "score 컬럼은 실제 획득 점수를 기록"하라는 사용자 지시로 분리됐다. 판별
+    가위바위보 값도 계속 기록한다.
   - 무승부 판은 **개수 제한 없이** 모두 기록한다. 판 수가 정해져 있지 않으므로 play1~playN 고정 컬럼 대신
   **plays 컬럼 하나(JSON 배열)** 에 무승부 판을 포함한 모든 판을 순서대로 저장한다.
 - rank_weekly (주간 랭킹 테이블/월요일 리셋/date_start 로 주간별 정보 체크) : date_start, userid, score
@@ -412,6 +488,13 @@ Colyseus 기본 라우팅이 룸 타입을 안 보고 로드만 보는 문제를
 
 > ⚠️ 개발 PC 의 `rps_game` DB 에 이 설계와 다른 옛 테이블(phone VARCHAR(20), score_max 있음, `game_result_log` 단일 테이블)이 미리 있었던 적이 있다.
 > 전부 빈 테이블이라 지우고 이 설계로 다시 만들었다. **다른 환경에서** `db:init` **하기 전에도 기존 테이블 구조를 먼저 확인할 것.**
+
+> ⚠️ **컬럼 추가/이름 변경은 `db:init` 으로 자동 반영되지 않는다** (`CREATE TABLE IF NOT EXISTS` 는 이미
+> 있는 테이블을 안 건드린다). `user_play_info` 에 `total_score`/`today_score` 를 추가하고 `game_log` 의
+> `score`→`vs` 이름 변경 + 새 `score`(실제 획득 점수) 컬럼을 추가했을 때(2026-10-01), 개발 DB 에 이미
+> 있던 테이블은 `ALTER TABLE` 을 직접 1회 실행해서 맞췄다(과거 `game_log` 로우의 새 `score` 값은 `vs`
+> 로부터 역산: `"2:0"`→20, `"2:1"`→10). **다른 환경에 배포할 때도 스키마가 바뀌면 `schema.sql`/
+> `gameLogSchema.ts` 변경만으로는 부족하고, 기존 테이블은 별도로 마이그레이션해야 한다.**
 
 - "오늘"의 기준은 매일 00:00:00 ~ 23:59:59 (서버 시간 KST 기준). today_game_count / today_win_count 와 rank_daily 모두 이 기준을 따른다.
 - 랭킹은 **1~100위**까지 보여 주고, 조회한 유저 **본인의 순위와 점수**를 함께 보여 준다 (100위 밖이어도 표시).
@@ -469,7 +552,7 @@ Colyseus 메시지 이름 = `type`, 메시지 본문 = envelope.
   `ONE_REMAIN_TIME` 이 `count:0` 이 되는 시점과 같다). 양쪽 선택이 모이면(또는 시간 초과되면) 서버가 즉시
    `ONE_RESULT` `{player1, player2, win?}` 를 양쪽에 보낸다
 10. 무승부면 판 수에 넣지 않고, 2/3판이면 `ONE_RESULT` 전송 5초 뒤(결과 연출 시간) `ONE_START` 로 같은 판을
-  다시 진행한다. 누군가 2판을 먼저 이기면 `ONE_START` 대신 `GAME_RESULT` `{player1, player2, win}` 로 최종 결과를 보낸다
+  다시 진행한다. 누군가 2판을 먼저 이기면 `ONE_START` 대신 `GAME_RESULT` `{winner, loser}` 로 최종 결과를 보낸다
 11. 클라이언트는 `GAME_RESULT` `{replay:"Y"}` 로 재게임 여부를 응답한다. `{replay:"N"}` 을 보내면(문서에 없는
   확장) **상대 응답을 기다리지 않고 그 유저만 즉시** `RETURN_TO_LOBBY` 를 받고 연결이 끊긴다
     (`CloseCode.CONSENTED`). 양쪽 다 응답을 마치면(둘 다 명시적으로 보냈든, 한쪽이 N 으로 먼저 나갔든)
@@ -495,8 +578,10 @@ ENTER_LOBBY / NAME 은 통신 정리 문서(위 링크) 기준. 나머지는 이
 | NAME            | S→C | `{ result: "Y"|"N", error?: 1|2 }`                                                                              | NAME 결과. **요청과 같은 type 을 그대로 재사용한다**                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | PLAY_INFO       | C→S | `{}` (없음)                                                                                                       | 게임 정보(플레이 통계) 요청. 등록된 핸들러가 없는 메시지를 보내면 Colyseus 가 연결을 끊는다 — 반드시 처리해야 함                                                                                                                                                                                                                                                                                                                                                                                                         |
 | PLAY_INFO       | S→C | `{ result: "Y", total_game_count, total_win_count, today_game_count, today_win_count }`                         | PLAY_INFO 결과. **요청과 같은 type 을 그대로 재사용한다**. ENTER_LOBBY 때 세션에 들고 있는 값을 그대로 응답(DB 재조회 없음). 문서에 실패 케이스 없음 — 순서가 안 맞으면 무시                                                                                                                                                                                                                                                                                                                                                          |
-| RANK_INFO       | C→S | `{ period: "daily"\|"weekly" }`                                                                                  | 랭킹 조회 요청(로그인=`ENTER_LOBBY` 이후). 문서(통신규약 시트)에 랭킹 메시지가 없어 CLAUDE.md 가 기준이다(Phase 8)                                                                                                                                                                                                                                                                                                                                                                                                     |
-| RANK_INFO       | S→C | `{ result: "Y", period, rank_list: [{rank, userid, name, score}], my_rank, my_score }`                          | **요청과 같은 type 을 그대로 재사용한다**. `rank_list` 는 1~`RANKING_LIST_SIZE`(100)위(동점자는 같은 순위 — `RANK()` 윈도우 함수). `my_rank`/`my_score` 는 100위 밖이거나 이번 기간에 한 판도 안 했어도 항상 온다(안 했으면 0점 기준으로 순위 계산). `PLAY_INFO` 와 같은 패턴으로 문서에 실패 케이스 없음 — ENTER_LOBBY 전이거나 형식이 잘못되면 무시                                                                                                                                                                                                                                                                          |
+| RANK_DAILY      | C→S | `{}` (없음)                                                                                                       | 일간 랭킹 조회 요청(로그인=`ENTER_LOBBY` 이후). 2026-10-01 **통신규약 시트에 추가됨** — 문서 기준                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| RANK_DAILY      | S→C | `{ date, list: [[name, score], ...], my: {rank, score} }`                                                       | **요청과 같은 type 을 그대로 재사용한다**. `date` 는 오늘 날짜(`"YYYY.MM.DD"`). `list` 는 문서 payload 그대로 `[name, score]` 튜플 배열이며, 서버는 `RANKING_LIST_SIZE`(100)개를 보낸다(문서 비고는 "상위 10명"이지만 몇 명을 보여줄지는 클라이언트가 정하기로 함, 2026-10-01). `my` 는 100위 밖이거나 오늘 기록이 아예 없어도 항상 온다(0점 기준으로 순위 계산, 동점자는 같은 순위 — `RANK()` 윈도우 함수). `PLAY_INFO` 와 같은 패턴으로 실패 케이스 없음 — ENTER_LOBBY 전이면 무시                                                                                                                                                                                        |
+| RANK_WEEKLY     | C→S | `{}` (없음)                                                                                                       | 주간 랭킹 조회 요청. 2026-10-01 통신규약 시트에 추가됨 — 문서 기준                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| RANK_WEEKLY     | S→C | `{ term: {start, end}, list: [[name, score], ...], my: {rank, score} }`                                         | **요청과 같은 type 을 그대로 재사용한다**. `term` 은 이번 주 월요일~일요일(`"YYYY.MM.DD"`). 나머지는 `RANK_DAILY` 와 동일(단 `rank_weekly` 테이블 기준)                                                                                                                                                                                                                                                                                                                                                                       |
 | JOIN_MATCH      | C→S | `{ select: "Y"|"N" }`                                                                                           | `select:"Y"` = "게임 참여"(매칭 대기열 등록), `select:"N"` = 매칭 대기 취소(대기열에서 빼고 로비에 남음, 이미 매칭된 뒤 도착하면 무시). **예전에 별도였던** `CANCEL_MATCH` **는 폐지하고 여기로 통합했다** (문서 반영)                                                                                                                                                                                                                                                                                                                         |
 | MATCH_FOUND     | S→C | `{ room_name, room_id, seat_reservation, opponent: { name, avatar } }`                                          | 매칭 완료. 상대 userid 는 보내지 않는다. `seat_reservation` 으로 게임 채널에 접속하는 방법은 아래 "게임 채널 접속 방식" 참고                                                                                                                                                                                                                                                                                                                                                                                          |
 | REJOIN_GAME     | S→C | `{ room_name, room_id, reconnection_token }`                                                                    | 게임 중이던 유저가 F5 등으로 세션을 잃고 다시 `ENTER_LOBBY` 를 보내면, 평범한 로비 입장 대신 전송하고 로비 연결을 끊는다(`CONSENTED`). 문서에 없는 메시지(Phase 6-1, `MATCH_FOUND` 와 같은 자리 — CLAUDE.md 가 기준). `reconnection_token` 은 `"roomId:토큰"` 합성 문자열이라 클라이언트는 받은 값을 그대로 `client.reconnect()` 에 넘기면 된다(`consumeSeatReservation()` 이 아니다 — 아래 "F5 재접속" 참고)                                                                                                                                                                     |
@@ -510,7 +595,7 @@ ENTER_LOBBY / NAME 은 통신 정리 문서(위 링크) 기준. 나머지는 이
 | ONE_REMAIN_TIME | S→C | `{ count }`                                                                                                     | `ONE_START` 이후 선택 제한 남은 초를 1초 단위로 전달(9,8,...,0). `count:0` 이 오면 선택 시간이 끝났다는 뜻(이 판은 자동 선택으로 마무리됨)                                                                                                                                                                                                                                                                                                                                                                               |
 | SELECT_GAME     | C→S | `{ select: "가위"|"바위"|"보" }`                                                                                     | 가위/바위/보 선택 제출. `CHOICE_TIMEOUT_SEC`(10초) 안에 안 보내면 서버가 무작위로 자동 선택                                                                                                                                                                                                                                                                                                                                                                                                               |
 | ONE_RESULT      | S→C | `{ player1, player2, win? }`                                                                                    | 한 판 결과. `player1`/`player2` 는 각자 낸 값, `win` 은 이긴 유저의 userid. **무승부(문서에 없는 상황)면** `win` **필드를 아예 보내지 않는다** — 무승부 판은 승수에 들어가지 않고 같은 판을 다시 진행한다                                                                                                                                                                                                                                                                                                                                   |
-| GAME_RESULT     | S→C | `{ player1, player2, win }`                                                                                     | 최종 결과. `player1`/`player2` 는 각자 이긴 판 수(무승부 제외), `win` 은 최종 승자 userid. 둘 중 하나가 2판을 먼저 이기면 전송. **점수(2:0=20점/2:1=10점)는 여기 안 보낸다** — DB/랭킹 전용 값이라 문서에도 없음                                                                                                                                                                                                                                                                                                                          |
+| GAME_RESULT     | S→C | `{ winner: {userid,win_count,win_per}, loser: {userid,win_count,win_per} }`                                     | 최종 결과. 둘 중 하나가 2판을 먼저 이기면 전송. `win_count` 는 그 유저가 이긴 판 수(무승부 제외), `win_per` 은 `total_win_count` 기준 승률(0~100 정수) — **이번 판 결과가 반영된 값**(DB 저장을 기다리지 않고 메모리 값에 즉시 +1 해서 계산, `GameRoom.FinishGame` 참고). 승자 userid 는 `winner.userid` 로 알 수 있어 별도 `win` 필드는 없다. 2026-10-01 사용자 지시로 통신규약 시트(`{player1,player2,win}`, 숫자)에서 이 형태로 바뀌었다 — 문서는 아직 갱신 전, 이 CLAUDE.md 가 최신 기준. **점수(2:0=20점/2:1=10점)는 여기 안 보낸다** — DB/랭킹 전용 값                                                                                                                                                                                                    |
 | GAME_RESULT     | C→S | `{ replay: "Y"|"N" }`                                                                                           | 재시작/나가기 선택. **요청과 같은 type 을 그대로 재사용한다**. `replay:"N"` 은 문서에 없는 확장 — 보내면 **상대 응답을 기다리지 않고 그 유저만 즉시** `RETURN_TO_LOBBY` 를 받고 연결이 끊긴다. 아무 응답도 안 하면 `REMATCH_CHOICE_TIMEOUT_SEC`(10초) 뒤에 같은 결과(나가기)로 처리된다                                                                                                                                                                                                                                                                          |
 | RETURN_TO_LOBBY | S→C | `{}` (없음)                                                                                                       | 로비 복귀 지시. **나가기를 선택한(또는 응답 없이 타임아웃된) 그 유저에게만** 보낸다(상대에게는 안 감 — 상대는 `OUT_USER`로 안다). 좌석 예약 시간 초과로 상대가 안 들어왔을 때도 같은 메시지를 쓴다. 이 메시지를 보낸 직후 연결을 끊는데, **어떤 코드로 끊든(**`CONSENTED`**=4000,** `WITH_ERROR`**=4002 둘 다) 클라이언트 SDK 는 이 방에 자동 재접속을 시도하지 않는다** — SDK 가 재접속을 시도하는 경우는 `NO_STATUS_RECEIVED`/`ABNORMAL_CLOSURE`/`GOING_AWAY`/`MAY_TRY_RECONNECT` 뿐이고(`@colyseus/sdk` 의 `Room.cjs` `onclose` 핸들러 확인), 그 외 코드는 그냥 `onLeave` 로만 알린다. 그래서 클라이언트는 이 메시지를 받으면 안전하게 새 연결로 로비에 접속하면 된다 |
 | ERROR           | S→C | `{ code, message }`                                                                                             | ENTER_LOBBY/NAME 이 아닌, 문서 범위 밖 상황(ENTER_TIMEOUT, NO_GAME_ROOM 등)에만 쓴다                                                                                                                                                                                                                                                                                                                                                                                                          |

@@ -6,7 +6,7 @@ import type { Delayed } from "@colyseus/timer";
 import { ENTER_LOBBY_TIMEOUT_SEC, MAX_CLIENTS_PER_CHANNEL } from "../../common/constants.js";
 import { LogConnect, LogDisconnect, RegisterLoggedMessage } from "../../common/log.js";
 import { SendError, SendResult } from "../../common/messages.js";
-import { EnterLobbyErrorCode, ErrorCode, MessageType, type JoinMatchPayload, type RankInfoPayload } from "../../common/types.js";
+import { EnterLobbyErrorCode, ErrorCode, MessageType, type JoinMatchPayload } from "../../common/types.js";
 import { RegisterRoom, UnregisterRoom } from "../../common/roomRegistry.js";
 import { LobbyManager } from "./LobbyManager.js";
 
@@ -53,8 +53,12 @@ export class LobbyRoom extends Room {
             this.manager.HandlePlayInfo(client);
         });
 
-        RegisterLoggedMessage<RankInfoPayload>(this, MessageType.RANK_INFO, async (client, message) => {
-            await this.manager.HandleRankInfo(client, message);
+        RegisterLoggedMessage(this, MessageType.RANK_DAILY, async (client) => {
+            await this.manager.HandleRankDaily(client);
+        });
+
+        RegisterLoggedMessage(this, MessageType.RANK_WEEKLY, async (client) => {
+            await this.manager.HandleRankWeekly(client);
         });
 
         RegisterLoggedMessage<JoinMatchPayload>(this, MessageType.JOIN_MATCH, async (client, message) => {

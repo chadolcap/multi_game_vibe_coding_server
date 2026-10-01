@@ -182,8 +182,15 @@ Phase 9  부하 테스트 / 배포 준비  (300명 동시 접속 확인)
 
 ### 2-4. 쿼리 모듈 (`src/db/queries/`)
 - [x] `userPartnerInfo.ts` — (partner, mid) → userid 조회
-- [x] `userInfo.ts` — user_partner_info + user_member_info + user_play_info 조회 (phone 포함, DB 내부용 `CachedUserInfo`)
-- [x] phone 갱신 쿼리 — 기존 유저가 저장된 값과 **다른 phone** 을 보내면 user_member_info.phone 업데이트 (같으면 쓰지 않음, `UpdatePhoneIfChanged`)
+- [x] `userInfo.ts` — user_partner_info + user_member_info + user_play_info 조회 (phone 포함, DB 내부용 `DbUserInfo`)
+- [x] phone 갱신 쿼리 — 기존 유저가 저장된 값과 **다른 phone** 을 보내면 user_member_info.phone 업데이트 (같으면 쓰지 않음, `UpdatePhoneIfChanged` — `WHERE phone <> ?` 로 단일 UPDATE 문 안에서 비교, 별도 SELECT 없음)
+  - ⚠️ **2026-10-01 재점검**: phone 이 Redis 캐시(`user:info:{userid}`)에도 그대로 저장되고 있어서
+    CLAUDE.md "phone 은 ... Redis 공유 정보에 넣지 않는다" 원칙과 실제 코드가 어긋나 있었다 — 사용자
+    지적으로 DB 조회 전용 `DbUserInfo`(phone 포함)와 Redis 캐시(phone 없는 `UserInfo`)를 분리했다.
+    대신 **캐시 히트 시에는 phone 비교/갱신을 생략**한다(phone 은 통계 전용 정보라 즉시성보다 캐시
+    적중률 우선, 사용자 결정) — DB 를 다시 조회할 때(캐시 미스)만 비교/갱신된다. 임시 스크립트로 검증:
+    신규 등록 시 캐시에 phone 없음, 캐시 히트 중엔 phone 달라도 DB 불변, 캐시 만료 후엔 실제 갱신됨,
+    갱신 후에도 캐시엔 phone 안 들어감 — 8/8 통과 (CLAUDE.md "유저 정보 처리 단계" 참고)
 - [x] `userRegistration.ts` — 첫 접속 유저를 3개 테이블에 **한 트랜잭션**으로 등록 (gender 는 user_partner_info, phone 은 user_member_info 에 저장)
   - 동시에 두 번 호출돼도 한 번만 만들어지게 `INSERT IGNORE` 사용
 
@@ -235,23 +242,37 @@ Phase 9  부하 테스트 / 배포 준비  (300명 동시 접속 확인)
      - ⚠️ phone 은 개인정보 — 에러 로그에도 값 그대로 남기지 않는다 (뒷자리 4자리만 남기고 마스킹, `MaskPhone()`)
      - 1차 구현은 별도 인증 없음. `VerifyAuth()` 함수를 미리 분리해 둬서 나중에 토큰 검증만 채우면 되게 함
   3. userid 생성 → `userRepository` 로 유저 조회(없으면 생성) — 이 과정에서 Redis 에도 저장됨
-  4. 같은 userid 가 이미 로비 대기 중이거나 게임 중 → `ALREADY_CONNECTED`
+  4. 같은 userid 가 이미 **이 로비 룸에 대기 중**이면 → `ENTER_LOBBY{result:"N", error:2}`(중복 접속)
+     로 응답. ⚠️ 2026-10-01 정정: 별도 메시지 `ALREADY_CONNECTED` 가 아니다 — 처음 설계 당시 이름이
+     이렇게 적혀 있었는데, 2026-09-30 문서 갱신으로 모든 실패가 `ENTER_LOBBY` 의 `error` 코드로
+     통합됐다(`EnterLobbyErrorCode.DUPLICATE_CONNECTION`=2, `LobbyManager.HandleEnterLobby` 참고).
      (지금은 **이 로비 룸 안에서만** 검사한다 — 다른 채널/게임 중 여부는 CLAUDE.md 흐름 12번대로 아직 막지 않음)
-  5. 성공 → `LOBBY_ENTERED { user, is_new_user }` 전송, 대기 목록에 등록
-- [x] 이미 입장한 연결이 `ENTER_LOBBY` 를 또 보내면 → `ALREADY_ENTERED` (연결은 유지)
-- [x] 기존 유저의 phone 이 바뀌었으면 DB 갱신 → `SaveUserCache` 로 Redis 도 갱신 (write-through) — Phase 2 의 `GetOrCreateUser` 가 이미 처리
+  5. 성공 → `ENTER_LOBBY{result:"Y", userid, new, name, avatar}` 전송(옛 `LOBBY_ENTERED` 는 폐지,
+     위 "통신 프로토콜" 섹션 참고), 대기 목록에 등록
+- [x] 이미 입장한 연결이 `ENTER_LOBBY` 를 또 보내면 → 역시 같은 `error:2`(연결 종료) — 이것도 처음엔
+  별도 메시지 `ALREADY_ENTERED` 였다가 위와 같은 이유로 통합됐다. **2026-10-01 정정**: 이 경로만
+  `client.leave()` 호출이 빠져 있어 연결이 유지되는 버그가 있었다(아래 `waiting_by_userid` 중복 경로는
+  처음부터 끊고 있었음) — 사용자 지적으로 발견, 두 경로 모두 연결을 끊도록 통일했다
+- [x] 기존 유저의 phone 이 바뀌었으면 DB 갱신 — `GetOrCreateUser` 가 처리(Phase 2). phone 은 Redis
+  캐시엔 애초에 안 들어가므로(2026-10-01 변경, 아래 2-4 참고) "Redis 도 갱신"은 더 이상 해당 없음
 - [x] DB 오류 등 → `SERVER_ERROR` 후 연결 종료
 - [x] 연결을 끊을 때는 **반드시 종료 코드**를 준다 (`WITH_ERROR` = 4002)
 
 ### 3-3. 로비 퇴장
 - [x] 대기 목록에서 제거
 - [x] `TouchUserCache` 로 Redis TTL 만 다시 설정 (값은 이미 입장 때 저장되어 있음)
-  - 퇴장 시점에 Redis 에서 `CachedUserInfo` 를 다시 읽어(phone 포함) `TouchUserCache` 에 넘긴다 — 이미 만료됐으면
-    (드문 경우) 그냥 둔다. 다음 `ENTER_LOBBY` 때 DB 에서 다시 채워지므로 문제 없다
+  - 퇴장 시점에 Redis 에서 `UserInfo` 를 다시 읽어 `TouchUserCache` 에 넘긴다 — 이미 만료됐으면
+    (드문 경우) 그냥 둔다. 다음 `ENTER_LOBBY` 때 DB 에서 다시 채워지므로 문제 없다. (2026-10-01:
+    phone 은 이 캐시에 애초에 안 들어가므로 "phone 포함" 은 더 이상 해당 없음 — 위 2-4 참고)
 
 **완료 확인**
-- [x] 테스트 클라이언트로 접속 → `LOBBY_ENTERED` 수신 (2026-09-22, 직접 만든 최소 프로토콜 클라이언트로 확인 — 아래 참고)
-- [x] 각 에러 코드(`INVALID_REQUEST`, `INVALID_ID`, `ALREADY_ENTERED`, `ALREADY_CONNECTED`, `ENTER_TIMEOUT`(실제 10초 대기), `CHANNEL_FULL`)를 일부러 발생시켜 확인
+- [x] 테스트 클라이언트로 접속 → `LOBBY_ENTERED` 수신 (2026-09-22 당시 기준, 직접 만든 최소 프로토콜
+  클라이언트로 확인 — 이 메시지는 2026-09-30 문서 갱신으로 폐지되어 지금은 `ENTER_LOBBY` 성공 응답에
+  합쳐져 있다, 위 "통신 프로토콜" 섹션 참고)
+- [x] 각 에러 코드(`INVALID_REQUEST`, `INVALID_ID`, `ALREADY_ENTERED`, `ALREADY_CONNECTED`,
+  `ENTER_TIMEOUT`(실제 10초 대기), `CHANNEL_FULL`)를 일부러 발생시켜 확인 — 이름은 그 당시 설계 기준
+  기록이고, 지금은 `ENTER_TIMEOUT`(연결 종료, 문서 범위 밖이라 그대로 유지)을 뺀 나머지 전부
+  `ENTER_LOBBY{result:"N", error}` 로 통합됐다(1=형식 오류, 2=중복 접속, 3=DB 오류, 4=기타)
   - `CHANNEL_FULL` 은 `MAX_CLIENTS_PER_CHANNEL` 을 2로 잠시 낮춰서 확인 후 300으로 복구
 - [x] 로비를 나갔다가 다시 들어오면 DB 조회 없이 Redis 에서 정보를 가져온다. (실제 `leave()` 후 재접속 + Redis TTL 값(119초)까지 확인)
 - [x] `CLAUDE.md` 의 ERROR 코드 표와 실제 동작이 일치한다. (`SERVER_ERROR` 는 코드 리뷰로만 확인 — DB 장애를 실제로 일으키진 않음)
@@ -357,7 +378,10 @@ Phase 9  부하 테스트 / 배포 준비  (300명 동시 접속 확인)
 
 **완료 확인**
 - [x] 테스트 클라이언트 2개로: 로비 접속 → 게임 참여 → `MATCH_FOUND` → 게임방 입장까지 성공 (2026-09-22)
-- [ ] ~~기다리는 방이 있으면 로비 유저 1명이 새 방이 아니라 그 방으로 들어간다.~~ → Phase 5 전까지는 기다리는 방이 생길 수 없어 테스트 불가 (Push 하는 코드가 없음). Phase 5 에서 함께 확인
+- [x] 기다리는 방이 있으면 로비 유저 1명이 새 방이 아니라 그 방으로 들어간다. → Phase 4 시점엔 기다리는
+  방이 생길 수 없어 테스트 불가했는데(Push 하는 코드가 없었음), 예정대로 **Phase 5-4 에서 함께 확인됨**
+  — `check_waiting_match_bug.ts` 로 A 재게임/B 나가기 → B 재매칭 → A 의 기다리는 방으로 정확히 들어가는
+  전체 흐름 확인(8/8 통과, 위 2026-09-30 후속 수정 항목과 같은 테스트 — CLAUDE.md 참고)
 - [x] 게임방 입장 시 Redis/DB 조회가 일어나지 않는다. (`GameRoom.ts` 에 db/redis import 자체가 없음 — 코드로 보장)
 - [x] 클라이언트가 받은 `seat_reservation` 안에 유저 정보가 들어 있지 않다. (`{name, sessionId, roomId, processId}` 뿐 — 테스트로 확인)
 - [x] 테스트 클라이언트 여러 개로 1번 채널이 먼저 차는지 확인
@@ -412,8 +436,15 @@ Phase 9  부하 테스트 / 배포 준비  (300명 동시 접속 확인)
 - [x] 승패 판정 → `ONE_RESULT` (`GameRoom.ts` `JudgeChoice`/`ResolveRound`). 무승부면 `win` 필드를 아예 보내지
   않음 (문서에 없는 상황이라 서버가 추가함 — `win?: string`)
 - [x] 무승부면 같은 판을 다시 진행 (승수에 넣지 않고, `ONE_RESULT_DELAY_SEC`(5초) 뒤 `SendOneStart()` 재호출)
-- [x] **먼저 2판을 이긴 사람이 나오면 즉시 게임 종료** → `GAME_RESULT { player1, player2, win }` 전송
-  (`GameRoom.ts` `FinishGame`). `check_rounds.ts` 로 무승부→승→패→승(2:1) 전체 흐름 확인함
+- [x] **먼저 2판을 이긴 사람이 나오면 즉시 게임 종료** → `GAME_RESULT` 전송 (`GameRoom.ts` `FinishGame`).
+  `check_rounds.ts` 로 무승부→승→패→승(2:1) 전체 흐름 확인함
+  - ⚠️ payload 는 처음에 `{player1, player2, win}`(각자 이긴 판 수 숫자 + 승자 userid)이었다가,
+    2026-10-01 사용자 지시로 **`{winner:{userid,win_count,win_per}, loser:{userid,win_count,win_per}}`**
+    로 바뀌었다(`win_per` 은 `total_win_count` 기준 승률, 이번 판 결과를 DB 저장 전에 메모리 값으로
+    즉시 반영 — CLAUDE.md 메시지 표 참고). 통신규약 시트는 아직 옛 형태라 CLAUDE.md 가 최신 기준.
+  - [x] 2026-10-01 `check_e2e_full.ts`(임시 스크립트, 테스트 후 삭제)로 실제 게임을 2:0 으로 끝까지
+    진행해 종단 검증 완료 — `winner.win_count=2`/`win_per=100`, `loser.win_count=0`/`win_per=0`, 옛
+    `win` 필드는 더 이상 안 옴, 모두 확인됨 (16/16 통과, Phase 8 로비 e2e 검증과 같은 스크립트로 함께 확인)
 - [x] 상대가 라운드 중간에 나가면(연결 종료) 판정하지 않고 멈춤 — `SendOneStart`/`ResolveRound` 앞단에
   `players.size < PLAYERS_PER_ROOM` 가드 추가. **재접속/봇 대체(Phase 6)는 아직 없음**, 지금은 그냥 멈추기만 함
 
@@ -475,7 +506,12 @@ Phase 9  부하 테스트 / 배포 준비  (300명 동시 접속 확인)
   선택 후 대기 중 브라우저를 닫거나 로비 이동을 누르면 소켓이 끊기니 대기 목록에서 빼고 방도 정리해야
   한다"고 요청해서 확인, 코드는 Phase 5-4 때 이미 이 요구사항대로 짜여 있었다(추가 수정 없음)
 - [x] 기다리던 유저가 연결이 끊겨도 "기다리는 방" 목록에서 지우고 방 정리 (위와 같은 `onLeave` 로직)
-- [ ] 로비로 보낼 때 `TouchUserCache` 로 Redis TTL 다시 설정 — Phase 5-3(DB/Redis 반영)과 함께 아직 미구현
+- [x] 게임방을 떠날 때 `TouchUserCache` 로 Redis TTL 다시 설정 — 2026-10-01 재확인 중 실제로 누락된 걸
+  발견해서 추가함(`GameRoom.onLeave`, 로비의 `LobbyManager.HandleLeave` 와 같은 패턴:
+  `GetUserCache` 로 캐시를 읽어 있으면 `TouchUserCache`). 게임 결과가 막 저장돼 캐시가 이미 최신이어도
+  TTL 을 다시 거는 건 안전하다(idempotent). `game_1` 재시작 후 `check_gameroom_touchcache.ts`(임시
+  스크립트, 테스트 후 삭제)로 실제 검증: 2:0 승부 진행 → `GAME_RESULT` → 둘 다 나가기(`replay:"N"`) →
+  `onLeave` 트리거 직후 `user:info` 캐시가 살아있고 TTL 이 115초 이상(최근에 다시 걸렸음)으로 확인, 3/3 통과
 
 > ✅ **결정된 규칙**
 > - 재게임/나가기 선택을 10초 동안 하지 않으면 **나가기로 처리**한다.
@@ -496,7 +532,10 @@ Phase 9  부하 테스트 / 배포 준비  (300명 동시 접속 확인)
   A 의 연결을 코드로 그냥 끊음(비정상 종료, close code 없음, "로비로 이동"/브라우저 닫기와 동일 경로) →
   Redis `waiting_rooms` 항목이 즉시 지워지고, `matchMaker.query()` 로 그 방이 실제로 dispose 된 것까지
   확인함(5개 체크 모두 통과)
-- [ ] DB 에 게임 로그와 전적이 저장되고, Redis 값도 같은 값으로 바뀐다.
+- [x] DB 에 게임 로그와 전적이 저장되고, Redis 값도 같은 값으로 바뀐다. — 2026-10-01 재확인(임시
+  스크립트, 테스트 후 삭제): `SaveGameResult` 호출 후 `game_log`(win/lose/vs/score) 와
+  `user_play_info`(total_game_count/total_win_count/total_score) 에 정확히 반영되고, Redis
+  `user:info:{userid}` 캐시도 write-through 로 같은 값에 TTL(120초)까지 걸려 있음을 확인, 6/6 통과
 
 ---
 
@@ -602,9 +641,9 @@ Colyseus 0.18(설치 버전)에는 `onLeave(client, code)` 하나가 아니라 *
 - [x] 봇이 플레이하는 중에 다시 접속하면 봇 대신 이어서 플레이하고, 결과 점수가 정상 반영된다. — `onReconnect`
   가 `bot_sessions` 를 지우므로 재접속 시점 이후로는 자동 선택 로직이 그 세션을 더는 봇으로 취급하지 않는다
   (코드로 보장 — 별도 재현 시나리오는 시나리오 1 과 사실상 동일한 경로라 추가 테스트는 생략)
-- [x] 끊긴 유저가 다시 로비에 접속할 때 `ALREADY_CONNECTED` 에 잘못 걸리지 않는다. — 게임 중 연결 끊김은
+- [x] 끊긴 유저가 다시 로비에 접속할 때 중복 접속(`error:2`) 에 잘못 걸리지 않는다. — 게임 중 연결 끊김은
   게임방(`GameRoom`)에서만 벌어지는 일이고 로비 대기 목록(`LobbyManager`)과는 별개 상태라 애초에 서로
-  간섭하지 않는다(코드 경로상 `ALREADY_CONNECTED` 는 `waiting_by_userid`/`match_queue` 에 이미 있는 userid
+  간섭하지 않는다(코드 경로상 `error:2` 는 `waiting_by_userid`/`match_queue` 에 이미 있는 userid
   로 다시 `ENTER_LOBBY` 할 때만 걸리는데, 게임 중인 유저는 애초에 로비 쪽 상태가 없다)
 
 > 💡 **테스트 방법**: 이번에도 Phase 3~5 처럼 공식 SDK 로 접속해 직접 확인했다(`check_reconnect.ts`,
@@ -723,7 +762,7 @@ Colyseus 0.18(설치 버전)에는 `onLeave(client, code)` 하나가 아니라 *
 
 ---
 
-## Phase 8 — 랭킹 (2026-09-30, 로직 구현/검증 완료 — 로비 e2e 는 재시작 후 확인 필요)
+## Phase 8 완료 — 랭킹 (2026-10-01, 로비 e2e 까지 검증 완료)
 
 - [x] "오늘" = 매일 **00:00:00 ~ 23:59:59** (서버 시간 KST 기준) — `CURDATE()`(DB 서버 타임존, 개발 PC는 로컬=KST) 사용
 - [x] `rank_daily` — 날짜별 점수 기록 (Phase 5-3 `AddRankScore` 에서 이미 구현됨)
@@ -733,27 +772,71 @@ Colyseus 0.18(설치 버전)에는 `onLeave(client, code)` 하나가 아니라 *
   - 게임 결과 반영 시(`queries/gameResult.ts` `UpdatePlayInfoAfterGame`): 그제서야 실제로 1(또는 0)로 리셋 + `today_date` 갱신
   - Redis 캐시(TTL 120초)에 자정 직전 값이 잠깐 남는 오차는 감수(문서화만, 별도 처리 안 함) — CLAUDE.md "자정 롤오버" 참고
   - ⚠️ **실제로 겪은 버그**: `IF(...)` 표현식 컬럼이 mysql2 에서 문자열로 반환됨 → `CAST(... AS UNSIGNED)` 로 해결 (CLAUDE.md 참고)
-- [x] 로비에서 랭킹 조회 메시지 추가(`RANK_INFO`) → `CLAUDE.md` 메시지 표에 반영
-  - **1~100위** 목록 + 조회한 유저 **본인의 순위와 점수** (100위 밖이어도, 이번 기간 기록이 없어도 항상 옴)
-  - 본인 순위는 `RANK()` 윈도우 함수로 계산(동점자는 같은 순위 — "내 점수보다 높은 사람 수 + 1"과 동일). Redis Sorted Set 전환은 지금 규모에서 불필요 판단, 보류
-  - 100위 목록은 `RANK_LIST_CACHE_TTL_SEC`(10초) 동안 Redis 캐시
+- [x] 로비에서 랭킹 조회 메시지 추가 → `CLAUDE.md` 메시지 표에 반영
+  - 처음엔 `RANK_INFO`(period 로 daily/weekly 선택) 하나로 설계했으나, 2026-10-01 통신규약 시트에
+    **`RANK_DAILY`/`RANK_WEEKLY` 두 개로 분리**된 공식 스펙이 추가되어 **문서 기준으로 전면 교체**했다.
+    `list` 는 문서 payload 그대로 `[name, score]` 튜플 배열(이전엔 `{rank,userid,name,score}` 객체였음).
+  - 문서 비고(H15/H17)는 "상위 10명"이라고 적혀 있지만, 서버는 그대로 `RANKING_LIST_SIZE`(100)개를
+    보내고 **클라이언트가 보여줄 개수를 정하는 것으로 결정**(2026-10-01, 기존 "1~100위" 설계 유지)
+  - 100위 목록(이름 붙인 최종 결과)은 `RANK_LIST_CACHE_TTL_SEC`(10초) 동안 Redis 캐시
+  - `RankPeriod`/`RankEntry` 타입은 프로토콜 타입이 아니라 DB 내부 구현 디테일이라 `common/types.ts` 가
+    아니라 `db/types.ts` 로 옮겼다(`db/queries/ranking.ts`/`db/rankingZSet.ts` 가 쓴다)
+- [x] **순위 계산을 Redis Sorted Set 으로 전환**(2026-10-01, 사용자 지시) — 처음엔 `RANK()` 윈도우
+  함수로 계산했는데, 사용자가 "요청마다 매번 SELECT 하면 부하 우려가 있지 않냐"고 지적 → 본인 순위
+  쿼리가 매번 그 기간 전체를 정렬하는 구조라 실제로 맞는 지적이었다. `db/rankingZSet.ts` 로 전환:
+  `ZSCORE`+`ZCOUNT`(둘 다 O(log N))로 본인 순위 계산, `ZREVRANGE` 로 top 100. `ZREVRANK` 대신 `ZCOUNT`
+  를 쓴 이유는 동점자 공동 순위("내 점수보다 높은 사람 수 + 1")를 유지하기 위해서다. MySQL 은 원본으로
+  그대로 두고 게임 결과 반영 시 이중 쓰기, Redis 데이터가 날아가면 MySQL 에서 자동 재구축(CLAUDE.md
+  "랭킹 조회 성능" 참고)
 
 **완료 확인**
 - [x] 랭킹 조회 로직 검증 — `check_phase8_logic.ts`(임시 스크립트, DB 함수 직접 호출, 테스트 후 삭제):
   동점자 같은 순위, 미참여 유저 0점 처리, 100위 밖 순위 계산 등 확인
 - [x] 자정 롤오버 로직 검증 — 같은 스크립트로 `today_date` 를 어제로 강제 설정 후 (1) 조회 시 0 보정,
   (2) 게임 결과 반영 시 실제 리셋 둘 다 확인, 13/13 통과
-- [ ] **로비 e2e 미검증** — `lobby_1`(6011)이 아직 이 Phase 이전 코드로 떠 있어(`RANK_INFO` 핸들러 없음)
-  실제로 `RANK_INFO` 를 보내면 Colyseus 가 미등록 메시지로 판단해 연결을 끊는 것(code 4002)까지 확인함.
-  `lobby_1`/`game_1` 을 최신 코드로 재시작한 뒤 실제 로비 클라이언트로 재확인 필요 (Phase 7 때와 같은 패턴)
+- [x] `RANK_DAILY`/`RANK_WEEKLY` payload 형식 검증 — `check_rank_daily_weekly.ts`(임시 스크립트, 테스트 후
+  삭제): `date`/`term` 날짜 포맷(`"YYYY.MM.DD"`), `term` 이 월~일 7일 구간인지, `my`/`list` 값 모두 확인, 8/8 통과
+- [x] Redis Sorted Set 전환 검증 — `check_rank_zset.ts`(임시 스크립트, 테스트 후 삭제): 3명(A/B/C)이
+  여러 판을 치른 뒤 점수 누적/동점자 처리/본인 순위가 모두 정확한지, **Redis 키를 강제로 지운 뒤에도
+  MySQL 에서 자동 재구축되어 같은 결과가 나오는지**(핵심 안전장치) 확인, 8/8 통과
+- [x] **로비 e2e 검증 완료**(2026-10-01, `lobby_1`/`game_1` 최신 코드 재시작 후) — `check_e2e_full.ts`
+  (임시 스크립트, `@colyseus/sdk` 로 실제 접속, 테스트 후 삭제): 로비 매칭 → 게임 채널 입장 → 2:0 승부
+  진행 → `GAME_RESULT` 수신 → 로비 재접속 → `RANK_DAILY`/`RANK_WEEKLY` 조회까지 전체 흐름,
+  오늘/이번 주 점수가 실제로 20점(2:0 승리)으로 반영됨까지 확인, 16/16 통과
 
 ---
 
 ## Phase 9 — 부하 테스트 / 배포 준비
 
-- [ ] 부하 테스트 스크립트 작성 (가짜 클라이언트 수백 개)
-- [ ] 로비 채널당 300명, 게임 채널당 200명(방 100개) 동시 접속 확인
-- [ ] 채널 이동 시 DB 조회 횟수 측정 → 하이브리드 방식으로 DB 부하가 줄었는지 확인
+- [x] 부하 테스트 스크립트 작성 (가짜 클라이언트 수백 개) — 2026-10-01, 임시 스크립트(`@colyseus/sdk`
+  로 실제 접속, 테스트 후 삭제) 3개로 아래 두 항목 검증
+- [x] 로비 채널당 300명, 게임 채널당 200명(방 100개) 동시 접속 확인
+  - **로비 300명**: 302명을 동시 접속시켜 정확히 300명 성공 + 나머지 2명 `error:4`(채널 인원 초과)
+    확인, 3/3 통과(`load_test_lobby.ts`)
+  - **게임 채널 200명(100방)**: 처음엔 202명을 **완전히 동시에** 매칭 요청했더니 심각한 문제를
+    발견했다 — `LobbyManager.TryMatch()` 가 매칭 쌍을 `while` 루프로 **한 쌍씩 순차 처리**하다 보니,
+    뒤 순번 유저는 좌석 예약 10초(`SEAT_RESERVATION_SEC`) 제한을 넘겨버려 **87명이 좌석을 소비하고도
+    상대가 안 들어와 `RETURN_TO_LOBBY` 로 쫓겨났고**, 최종적으로 10명(5쌍)만 입장 성공(`load_test_game.ts`,
+    0/4 통과). ⚠️ 다만 테스트 클라이언트 202개도 같은 로컬 머신에서 서버와 자원을 나눠 쓰고 있어, 순수
+    서버 병목이라고 단정하긴 어려운 환경 제약이 있다.
+  - 202명을 **10초에 걸쳐 분산** 접속시키는(평균 약 20명/초) 현실적인 시나리오로 재테스트하니 전혀
+    다른 결과가 나왔다 — **쫓겨난 유저 0명**, 198명 입장 성공(`load_test_game2.ts`, 2/5 통과).
+    "완전 동시 폭주"는 극단적 상황에서만 문제가 됨을 확인했다.
+  - 198/4 로 갈린 건(기대값 200/2) 100번째 방 경계에서 두 쌍이 거의 동시에 도착하면 둘 다
+    `matchMaker.query().length >= MAX_ROOMS_PER_GAME_CHANNEL` 체크를 통과 못 하는 **레이스 컨디션**으로
+    보인다 — 방이 100개보다 많이 생기는 쪽이 아니라 적게 생기는(보수적) 쪽으로 실패해 데이터 무결성
+    문제는 없지만, 경계에서 약간의 용량 손실이 있다. 심각도가 낮아 이번엔 고치지 않고 기록만 해 둔다
+    (필요해지면 `RoomManager.CreateRoomForTwo` 의 방 개수 체크 방식을 다시 볼 것).
+- [x] 채널 이동 시 DB 조회 횟수 측정 → 하이브리드 방식으로 DB 부하가 줄었는지 확인 — 2026-10-01,
+  `check_db_query_count.ts`(임시 스크립트, MySQL `SHOW GLOBAL STATUS` 의 `Com_select`/`Com_insert`/
+  `Com_update` 를 단계마다 비교, 테스트 후 삭제)로 실측, 5/5 통과:
+  - 신규 유저 등록(2명): INSERT 6(3개 테이블×2명), SELECT 2
+  - **Redis 캐시 있는 재접속**: SELECT **0**
+  - **로비 → 게임방 이동**(매칭+좌석 소비+`ENTER_ROOM`): SELECT/INSERT/UPDATE 모두 **0** — 좌석 예약에
+    유저 정보를 담아 전달하는 하이브리드 설계가 숫자로도 확인됨
+  - 게임 결과 반영(`SaveGameResult`): INSERT 5(`game_log` 1 + `AddRankScore` ON DUPLICATE KEY 4),
+    UPDATE 2(승자/패자 `user_play_info`), SELECT 2(`RefreshUserCache` 승자/패자 재조회)
+  - **게임 직후 로비 복귀**: SELECT **0** — `RefreshUserCache` 가 이미 Redis 를 최신화해 둔 덕분
 - [ ] 로그 정리 (에러는 반드시 남기고, 개인정보·통계 데이터는 외부로 노출하지 않기)
 - [ ] 6개 채널을 한 번에 켜고 끄는 실행 방법 정리 (예: PM2)
 - [ ] 운영 환경 TLS 인증서 준비 및 모든 채널 wss 접속 확인 (인증서 갱신 절차 포함)

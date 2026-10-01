@@ -7,6 +7,7 @@ import type { UserInfo } from "../common/types.js";
 import { GetDbPool } from "./connection.js";
 import { AddRankScore, InsertGameLog, UpdatePlayInfoAfterGame, type GameLogEntry, type PlayRecord } from "./queries/gameResult.js";
 import { FetchUserInfo } from "./queries/userInfo.js";
+import { IncrementRankScore } from "./rankingZSet.js";
 import { GetUserCache, SaveUserCache } from "./userCache.js";
 import { ToPublicUserInfo } from "./types.js";
 
@@ -34,16 +35,26 @@ export async function SaveGameResult(input: SaveGameResultInput): Promise<SaveGa
     const pool = GetDbPool();
     const score = input.loser_win_count === 0 ? SCORE_WIN_STRAIGHT : SCORE_WIN_NORMAL;
 
-    await UpdatePlayInfoAfterGame(pool, input.winner_userid, input.loser_userid);
-    await AddRankScore(pool, input.winner_userid, score);
-    await AddRankScore(pool, input.loser_userid, SCORE_LOSE);
+    await UpdatePlayInfoAfterGame(pool, input.winner_userid, input.loser_userid, score, SCORE_LOSE);
+    // rank_daily/rank_weekly(MySQL, 원본)와 랭킹 Sorted Set(Redis, 조회용 인덱스)을 함께 갱신한다 —
+    // 2026-10-01 Redis Sorted Set 전환(사용자 요청) 이후의 "이중 쓰기" 지점. 패자도 0점으로 ZINCRBY 해서
+    // "오늘(이번 주) 참여했다"는 멤버 자체는 남겨 둔다(AddRankScore 가 MySQL 에 0점 행을 만들어 두는 것과 동일한 이유).
+    await Promise.all([
+        AddRankScore(pool, input.winner_userid, score),
+        AddRankScore(pool, input.loser_userid, SCORE_LOSE),
+        IncrementRankScore("daily", input.winner_userid, score),
+        IncrementRankScore("daily", input.loser_userid, SCORE_LOSE),
+        IncrementRankScore("weekly", input.winner_userid, score),
+        IncrementRankScore("weekly", input.loser_userid, SCORE_LOSE),
+    ]);
 
     const game_log: GameLogEntry = {
         start_time: input.start_time,
         end_time: input.end_time,
         win: input.winner_userid,
         lose: input.loser_userid,
-        score: input.loser_win_count === 0 ? "2:0" : "2:1",
+        vs: input.loser_win_count === 0 ? "2:0" : "2:1",
+        score,
         plays: input.plays,
         win_is_bot: input.win_is_bot,
         lose_is_bot: input.lose_is_bot,
@@ -63,9 +74,10 @@ async function RefreshUserCache(pool: Pool, userid: string): Promise<UserInfo> {
     if (!fresh) {
         // 정상 흐름이면 없을 수 없다 (게임 중이던 유저는 이미 DB 에 등록돼 있음) — 방어적으로 캐시 값이라도 반환
         const cached = await GetUserCache(userid);
-        if (cached) return ToPublicUserInfo(cached);
+        if (cached) return cached;
         throw new Error(`게임 결과 반영 중 유저 정보를 찾지 못했습니다: userid=${userid}`);
     }
-    await SaveUserCache(fresh);
-    return ToPublicUserInfo(fresh);
+    const public_info = ToPublicUserInfo(fresh);
+    await SaveUserCache(public_info);
+    return public_info;
 }

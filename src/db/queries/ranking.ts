@@ -1,17 +1,14 @@
-// 랭킹 조회 쿼리 (Phase 8). rank_daily/rank_weekly 에서 상위 RANKING_LIST_SIZE(100)위 목록과 특정
-// 유저의 순위/점수를 가져온다. 동점자는 같은 순위를 받는다 — RANK() 윈도우 함수를 쓴다(개발 PC의
-// XAMPP MariaDB 10.4 는 윈도우 함수를 지원한다). "내 점수보다 높은 사람 수 + 1"(TASKS.md Phase 8)과
-// 같은 결과를 낸다.
+// 랭킹 관련 MySQL 접근 (Phase 8, 2026-10-01 Redis Sorted Set 전환 후).
+// 실시간 순위/점수 계산은 더 이상 여기서 하지 않는다 — db/rankingZSet.ts 의 Redis Sorted Set 이 담당한다.
+// 이 모듈은 (1) ZSET 이 비어있을 때(최초 조회, Redis 재시작 등) MySQL 에서 다시 채우는 재구축용 전체
+// 조회와 (2) 랭킹 목록에 표시할 이름을 userid 로 한 번에 조회하는 두 가지만 맡는다.
 
 import type { Pool, RowDataPacket } from "mysql2/promise";
-import { RANKING_LIST_SIZE } from "../../common/constants.js";
-import type { RankEntry, RankPeriod } from "../../common/types.js";
+import type { RankPeriod } from "../types.js";
 
-interface RankListRow extends RowDataPacket {
+interface RankRow extends RowDataPacket {
     userid: string;
-    name: string;
     score: number;
-    rnk: number;
 }
 
 // period 값은 RankPeriod 유니온 타입으로 제한되어 코드 내부에서만 오므로, 테이블명을 쿼리 문자열에
@@ -22,39 +19,20 @@ function TableAndDateCondition(period: RankPeriod): { table: string; date_condit
         : { table: "rank_weekly", date_condition: "date_start = DATE_SUB(CURDATE(), INTERVAL WEEKDAY(CURDATE()) DAY)" };
 }
 
-// 1~RANKING_LIST_SIZE(100)위 목록. 동점자 처리 때문에 LIMIT 경계에서 같은 점수의 다음 등수가 잘릴 수
-// 있지만, 실용적으로 "상위 100행"으로만 자른다.
-export async function GetRankList(pool: Pool, period: RankPeriod): Promise<RankEntry[]> {
+// 그 기간(오늘/이번 주) 전체 (userid, score) 로우. Redis Sorted Set 이 비어있을 때 재구축하는 용도로만 쓴다
+// — 평소에는 AddRankScore 의 ZINCRBY 가 ZSET 을 바로 채우므로 이 쿼리가 호출될 일이 거의 없다.
+export async function GetAllRankRows(pool: Pool, period: RankPeriod): Promise<{ userid: string; score: number }[]> {
     const { table, date_condition } = TableAndDateCondition(period);
-    const [rows] = await pool.query<RankListRow[]>(
-        `SELECT r.userid, COALESCE(m.name, '') as name, r.score, RANK() OVER (ORDER BY r.score DESC) as rnk
-         FROM \`${table}\` r
-         JOIN user_member_info m ON m.userid = r.userid
-         WHERE r.${date_condition}
-         ORDER BY rnk
-         LIMIT ${RANKING_LIST_SIZE}`
-    );
-    return rows.map((row) => ({ rank: row.rnk, userid: row.userid, name: row.name, score: row.score }));
+    const [rows] = await pool.query<RankRow[]>(`SELECT userid, score FROM \`${table}\` WHERE ${date_condition}`);
+    return rows.map((row) => ({ userid: row.userid, score: row.score }));
 }
 
-// 특정 유저의 순위/점수. 오늘(이번 주) 기록이 아예 없는 유저는 0점 취급하고 "0점보다 높은 사람 수 + 1"
-// 로 순위를 매긴다 — 100위 밖이어도, 이번 기간에 한 판도 안 했어도 항상 값을 준다.
-export async function GetMyRank(pool: Pool, period: RankPeriod, userid: string): Promise<{ rank: number; score: number }> {
-    const { table, date_condition } = TableAndDateCondition(period);
-
+// userid 목록으로 별명을 한 번에 조회한다 (랭킹 목록에 이름을 붙일 때 씀). 못 찾은 userid 는 결과 Map 에 없다.
+export async function GetNamesByUserids(pool: Pool, userids: string[]): Promise<Map<string, string>> {
+    if (userids.length === 0) return new Map();
     const [rows] = await pool.query<RowDataPacket[]>(
-        `SELECT rnk, score FROM (
-            SELECT userid, score, RANK() OVER (ORDER BY score DESC) as rnk
-            FROM \`${table}\` WHERE ${date_condition}
-         ) t WHERE userid = ?`,
-        [userid]
+        `SELECT userid, COALESCE(name, '') as name FROM user_member_info WHERE userid IN (?)`,
+        [userids]
     );
-    if (rows.length > 0) {
-        return { rank: rows[0].rnk as number, score: rows[0].score as number };
-    }
-
-    const [count_rows] = await pool.query<RowDataPacket[]>(
-        `SELECT COUNT(*) + 1 as rnk FROM \`${table}\` WHERE ${date_condition} AND score > 0`
-    );
-    return { rank: count_rows[0].rnk as number, score: 0 };
+    return new Map(rows.map((row) => [row.userid as string, row.name as string]));
 }
