@@ -25,6 +25,16 @@ export const REMATCH_CHOICE_TIMEOUT_SEC = 10;   // 재게임/나가기 선택 �
 export const CHANNEL_HEARTBEAT_TTL_SEC = 15;
 export const CHANNEL_HEARTBEAT_INTERVAL_SEC = 5;
 
+// 무중단 재시작(드레인, Phase 9) — 게임 채널을 "닫는 중"으로 표시해 새 매칭/기다리는 방 입장을 막고
+// (db/channelHeartbeat.ts MarkChannelClosing/IsChannelClosing), 그 채널의 진행 중인 게임이 모두
+// 끝날 때까지 index.ts 가 polling 으로 기다린다. CLOSING_TTL 은 이 Redis 표시가 혹시 안 지워져도
+// 영원히 남지 않게 하는 안전망일 뿐이다(정상적으로는 다음 기동 때 ClearChannelClosing 으로 지운다).
+export const CHANNEL_CLOSING_TTL_SEC = 60 * 60;       // 1시간 (안전망)
+export const CHANNEL_DRAIN_POLL_INTERVAL_SEC = 5;     // 진행 중인 게임이 다 끝났는지 이 간격으로 확인
+export const CHANNEL_DRAIN_MAX_WAIT_SEC = 10 * 60;    // 10분 — 이 시간이 지나도 안 끝나면 포기하고 종료 진행
+                                                       // (ecosystem.config.cjs 의 kill_timeout 이 이보다 짧으면
+                                                       //  PM2 가 먼저 SIGKILL 을 보내 버리니 반드시 더 길게 맞출 것)
+
 // ── 게임 규칙 ──
 export const WIN_COUNT_TO_FINISH = 2;           // 2선승제
 export const MAX_DECISIVE_ROUNDS = 3;           // 무승부를 뺀 최대 판 수

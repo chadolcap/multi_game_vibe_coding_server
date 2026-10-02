@@ -33,6 +33,11 @@ function ToPublicOpponentInfo(user: UserInfo): OpponentInfo {
     return { name: user.name, avatar: user.avatar };
 }
 
+// TryJoinWaitingRoom 에서 드레인 중인 채널의 "기다리는 방"을 건너뛰고 재시도할 최대 횟수.
+// 평소엔 0번이면 충분하다(드레인 중인 채널 자체가 드묾) — 여러 채널이 동시에 재시작 중인 극단적인
+// 경우를 대비한 안전 상한일 뿐이다.
+const MAX_WAITING_ROOM_SKIP_ATTEMPTS = 5;
+
 export class GameRoomMatcher {
     // 게임 중이던 유저가 (F5 등으로) 로비를 거쳐 다시 들어왔을 때, activeGame.ts 에 저장해 둔 재접속
     // 토큰이 아직 유효한지 확인한다.
@@ -57,27 +62,42 @@ export class GameRoomMatcher {
     }
 
     // "기다리는 방"이 있으면 유저 1명을 그 방에 넣는다. 없거나(정상) 실패하면(경합 등, 드묾) null.
+    //
+    // ⚠️ 무중단 재시작 드레인 중(채널이 "닫는 중")인 방은 건너뛴다 — 그 채널 프로세스는 새 상대가 영원히
+    // 안 들어오길 기다리고 있으므로(진행 중인 게임만 드레인 대상이라 "기다리는 방"은 그 집계에서 빠진다,
+    // roomRegistry.CountRoomsInProgress 참고), 여기서 새로 넣어주지 않아야 그 채널이 재시작을 끝낼 수
+    // 있다. 큐에서 꺼낸 걸 그대로 버린다(되돌려 넣지 않는다) — 어차피 그 방은 채널이 재시작되면 함께
+    // 사라지므로 다시 큐에 넣어도 다음 번에도 또 걸러질 뿐이다. 최대 몇 번만 다시 시도하고 그래도 안
+    // 되면(드레인 중인 "기다리는 방"이 여러 개 겹친 드문 경우) null 로 새 방 생성 경로로 넘긴다.
     public async TryJoinWaitingRoom(user: UserInfo): Promise<WaitingRoomMatch | null> {
-        const entry = await waitingRooms.PopWaitingRoom();
-        if (!entry) return null;
+        for (let attempt = 0; attempt < MAX_WAITING_ROOM_SKIP_ATTEMPTS; attempt++) {
+            const entry = await waitingRooms.PopWaitingRoom();
+            if (!entry) return null;
 
-        try {
-            const room_cache = await matchMaker.getRoomById(entry.room_id);
-            const reservation = await matchMaker.reserveSeatFor(room_cache, {}, { user } satisfies GameSeatAuth);
-            return {
-                room_name: entry.room_name,
-                room_id: entry.room_id,
-                reservation,
-                opponent: entry.opponent,
-            };
-        } catch (error) {
-            // 그 사이 방이 사라졌거나(상대가 나감) 꽉 찬 경우 — 드문 경합. 이 유저는 새 방 매칭으로 넘어가면 된다.
-            console.warn(
-                `[GameRoomMatcher] 기다리는 방 입장 실패, 새 매칭으로 넘어감 (room_id=${entry.room_id}):`,
-                error instanceof Error ? error.message : error
-            );
-            return null;
+            const channel_no = channelNames.ParseGameChannelNo(entry.room_name);
+            if (await channelHeartbeat.IsChannelClosing("game", channel_no)) {
+                continue; // 드레인 중인 채널의 기다리는 방 — 버리고 다음 걸 시도
+            }
+
+            try {
+                const room_cache = await matchMaker.getRoomById(entry.room_id);
+                const reservation = await matchMaker.reserveSeatFor(room_cache, {}, { user } satisfies GameSeatAuth);
+                return {
+                    room_name: entry.room_name,
+                    room_id: entry.room_id,
+                    reservation,
+                    opponent: entry.opponent,
+                };
+            } catch (error) {
+                // 그 사이 방이 사라졌거나(상대가 나감) 꽉 찬 경우 — 드문 경합. 이 유저는 새 방 매칭으로 넘어가면 된다.
+                console.warn(
+                    `[GameRoomMatcher] 기다리는 방 입장 실패, 새 매칭으로 넘어감 (room_id=${entry.room_id}):`,
+                    error instanceof Error ? error.message : error
+                );
+                return null;
+            }
         }
+        return null;
     }
 
     // 2명을 위한 새 게임방을 만든다. 지금 켜져 있는 채널 중 번호가 빠른 순으로 채우고, 꽉 차면 다음 채널.
@@ -93,6 +113,9 @@ export class GameRoomMatcher {
         const alive_channel_numbers = await channelHeartbeat.GetAliveGameChannels(constants.GAME_CHANNEL_COUNT);
 
         for (const channel_no of alive_channel_numbers) {
+            // 무중단 재시작 드레인 중인 채널 — 켜져 있긴 하지만(하트비트 살아있음) 새 방을 받지 않는다.
+            if (await channelHeartbeat.IsChannelClosing("game", channel_no)) continue;
+
             const room_name = channelNames.GetGameRoomName(channel_no);
 
             const existing_rooms = await matchMaker.query({ name: room_name });

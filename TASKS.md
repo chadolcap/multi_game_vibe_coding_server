@@ -961,12 +961,52 @@ Colyseus 0.18(설치 버전)에는 `onLeave(client, code)` 하나가 아니라 *
   경고가 떴다 — 둘 다 `pm2 deploy`(SSH 배포) 같은 안 쓰는 기능 쪽 의존성이라 당장 위험은 낮다고
   판단해 보류, 수정하려면 `pm2@5.3.1`(breaking change)로 내려가야 해서 섣불리 하지 않았다
 - [ ] 운영 환경 TLS 인증서 준비 및 모든 채널 wss 접속 확인 (인증서 갱신 절차 포함)
-- [ ] **무중단 게임 서비스** — 배포/재시작 중에도 진행 중인 게임이 끊기지 않게
+- [x] **무중단 게임 서비스** — 배포/재시작 중에도 진행 중인 게임이 끊기지 않게 (2026-10-02)
   1. 재시작할 채널을 "닫는 중" 상태로 표시 (Redis) → 새 매칭/새 입장을 받지 않음
   2. 매칭은 나머지 게임 채널로 보냄, 기다리는 방도 새로 받지 않음
   3. 진행 중인 게임이 모두 끝나면 프로세스 종료 → 새 버전으로 재시작 → "열림" 상태로 복귀
   4. 로비 채널은 2개를 **하나씩** 재시작 (끊긴 클라이언트는 다른 로비로 재접속)
   - 게임 채널 3개도 하나씩 순서대로 진행 (한 번에 모두 닫으면 `NO_GAME_ROOM` 발생)
+
+  **구현 (게임 채널만 — 로비/Watcher 는 위 4번대로 특별한 처리 없이 그냥 재시작한다)**:
+  - Colyseus 는 SIGINT/SIGTERM 을 받으면 기본적으로 **모든 클라이언트를 즉시 연결 종료**하고
+  `process.exit()` 한다(`@colyseus/core` `MatchMaker.gracefullyShutdown()` → `disconnectAll()` 확인,
+  진행 중인 게임을 기다려 주지 않는다) — 그래서 그 전에 끼어들 지점이 필요했다. `Server.onBeforeShutdown`
+  콜백이 `matchMaker.gracefullyShutdown()`(클라이언트 전부 끊는 부분) **이전에** await 되는 걸 확인하고,
+  거기에 드레인 로직을 넣었다(`index.ts`, `channel_type === "game"` 일 때만 등록).
+  - `db/channelHeartbeat.ts` 에 `MarkChannelClosing`/`IsChannelClosing`/`ClearChannelClosing` 추가
+  (Redis 키 `channel:game:{no}:closing`, 기존 하트비트 키와는 별개). 기존 하트비트(`alive`)는 그대로
+  두고 "닫는 중" 은 별도 키로 — "살아있음"과 "새 일을 받을지"는 서로 다른 개념이라 분리했다.
+  - `GameRoomMatcher.CreateRoomForTwo` 는 하트비트가 살아있어도 `IsChannelClosing` 이면 그 채널을
+  건너뛴다. `TryJoinWaitingRoom` 도 큐에서 꺼낸 "기다리는 방"이 닫는 중인 채널 소속이면 버리고
+  최대 `MAX_WAITING_ROOM_SKIP_ATTEMPTS`(5)번까지 다음 걸 시도한다.
+  - "진행 중인 게임"의 정의: `GameRoom.IsGameInProgress()` = `game_started && !game_over`. **"기다리는
+  방"(새 상대를 기다리는 중)은 진행 중으로 안 친다** — 안 그러면 드레인이 "새 상대를 안 받는다" +
+  "그 방이 안 끝났으니 기다린다"가 서로를 막아 영원히 안 끝나는 교착상태가 된다. 대신 그 방의 외로운
+  유저는 채널이 재시작되면 그냥 연결이 끊긴다(로비처럼 "끊기면 다시 들어오면 된다"로 처리 — 엄밀히는
+  "진행 중인 게임"이 아니라서 이 기능의 보장 범위 밖이라고 판단했다, 범위를 좁힌 결정이라 문서화해 둠).
+  - `common/roomRegistry.ts` 의 `RegisterRoom` 에 세 번째 인자(옵션) `IsGameInProgress` 콜백을
+  추가하고, `CountRoomsInProgress(room_name)` 으로 이 프로세스의 그 채널에 진행 중인 게임이 몇 개인지
+  센다. `GameRoom.onCreate()` 가 `IsGameInProgress()` 를 넘겨 등록한다.
+  - `index.ts` 의 `WaitUntilGamesFinish()` 가 `CHANNEL_DRAIN_POLL_INTERVAL_SEC`(5초)마다
+  `CountRoomsInProgress` 를 확인하다가 0 이 되면 바로 통과시킨다. `CHANNEL_DRAIN_MAX_WAIT_SEC`(10분)
+  이 지나도 안 끝나면 경고 로그만 남기고 포기하고 종료를 진행한다(영원히 기동 못 하는 것보다 나음).
+  - 채널이 새로 기동될 때마다 이전 생애의 "닫는 중" 표시가 남아 있을 수 있어 `ClearChannelClosing` 을
+  호출해 지운다(`server.listen()` 이후).
+  - `ecosystem.config.cjs` 의 `kill_timeout` 을 12분(드레인 최대 10분 + 여유 2분)으로 올렸다 — PM2
+  가 드레인이 끝나기 전에 SIGKILL 을 보내면 드레인 자체가 무의미해지므로 반드시 더 길어야 한다.
+
+  **검증**: `common/roomRegistry.ts`/`db/channelHeartbeat.ts` 의 핵심 로직(closing 플래그 Redis
+  왕복, 가짜 Room 으로 `CountRoomsInProgress` 집계)을 임시 스크립트로 6/6 통과 확인(테스트 후 삭제).
+  실제 SIGINT 전체 흐름은 `GAME_CHANNEL_COUNT` 를 잠깐 2 로 올리고(테스트 후 1 로 복구) 격리된
+  `game_2`(포트 6022, 아무도 안 쓰던 채널)를 PM2 로 띄워서 확인했다 — `pm2 stop` 으로 그치자(진행 중인
+  게임 없음 → 바로 종료), "채널을 닫는 중으로 표시" 로그 출력 + graceful exit + 포트 해제까지 확인.
+  PM2 를 거치지 않은 평범한 `node dist/index.js` 프로세스에 bash `kill -SIGINT`/`taskkill`(비강제)로
+  신호를 보내는 건 Windows 에서 실제 SIGINT 로 전달되지 않아 실패했다(PM2 는 Node 간 IPC 로 신호를
+  보내서 된다) — Windows 개발 환경에서 이 기능을 수동 테스트하려면 반드시 PM2(또는 같은 방식의
+  Node 프로세스 매니저)를 거쳐야 한다는 뜻이다. ⚠️ "진행 중인 실제 게임 중간에 SIGINT 를 보내 새
+  매칭이 다른 채널로 가고 기존 게임은 안 끊기는지"까지는 실제 2인 매치를 만들어야 해서 이번엔 검증
+  범위에서 뺐다(코드 리뷰 + 단위 테스트로만 확인) — 운영 배포 전 리허설에서 실제로 한 번 확인해 볼 것.
 - [ ] `CLAUDE.md` 의 폴더 구조 / 메시지 표를 실제 코드와 맞게 최종 갱신
 
 ---

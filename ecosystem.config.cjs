@@ -18,12 +18,14 @@
 // 올리고 재빌드해야 한다(지금은 개발 단계라 1 로 막아 둠). lobby_2 는 코드 제한이 없어 지금도 바로 켤
 // 수 있다. (CLAUDE.md "로컬 실행 방법" / "규모 스펙" 참고)
 //
-// kill_timeout: Colyseus 는 SIGINT/SIGTERM 을 받으면 자체적으로 graceful shutdown 을 시도하는데,
-// PM2 기본 kill_timeout(1.6초)으로는 그 전에 SIGKILL 로 강제 종료될 수 있어 넉넉하게 늘려 둔다.
-// "채널 단위로 새 입장을 막고 진행 중인 게임이 끝난 뒤 재시작"하는 무중단 로직(TASKS.md Phase 9)이
-// 아직 없어서 당장은 안전 마진 성격의 값이다 — 그 로직이 들어가면 실제 게임 한 판 최대 소요 시간을
-// 기준으로 다시 맞출 것.
-const KILL_TIMEOUT_MS = 60_000;
+// kill_timeout: 게임 채널은 SIGINT/SIGTERM 을 받으면 index.ts 의 server.onBeforeShutdown 이
+// "채널을 닫는 중"으로 표시하고 진행 중인 게임이 모두 끝나길 최대 CHANNEL_DRAIN_MAX_WAIT_SEC(10분,
+// src/common/constants.ts)만큼 기다린다(무중단 재시작 드레인, TASKS.md Phase 9) — PM2 의
+// kill_timeout 이 그보다 짧으면 드레인이 끝나기 전에 PM2 가 먼저 SIGKILL 을 보내 버려 드레인이
+// 무의미해진다. 반드시 CHANNEL_DRAIN_MAX_WAIT_SEC 보다 길게 잡을 것(여기선 여유 있게 +2분).
+// 로비/Watcher 는 드레인 로직이 없어 사실상 금방 끝나지만, 설정을 단순하게 유지하려고 모든 채널에
+// 같은 값을 쓴다.
+const KILL_TIMEOUT_MS = 12 * 60 * 1000; // 12분 (CHANNEL_DRAIN_MAX_WAIT_SEC=10분 + 여유 2분)
 
 function Channel(name, channel_type, channel_no) {
     return {

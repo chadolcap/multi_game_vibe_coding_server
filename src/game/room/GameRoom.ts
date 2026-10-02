@@ -115,8 +115,9 @@ export class GameRoom extends Room {
         this.lock();
         console.log(`[GameRoom] 생성됨 roomName=${this.roomName} roomId=${this.roomId}`);
 
-        // SEND_NOTICE 브로드캐스트 + 채널 유저 리포터(Watcher 의 ADMIN_CHANNEL_USER 용)가 이 방을 찾을 수 있도록 등록
-        roomRegistry.RegisterRoom(this, () => this.GetChannelUserEntries());
+        // SEND_NOTICE 브로드캐스트 + 채널 유저 리포터(Watcher 의 ADMIN_CHANNEL_USER 용) + 무중단 재시작
+        // 드레인(index.ts, 이 채널에 진행 중인 게임이 남아 있는지 확인)이 이 방을 찾을 수 있도록 등록
+        roomRegistry.RegisterRoom(this, () => this.GetChannelUserEntries(), () => this.IsGameInProgress());
 
         // 좌석 예약 후 SEAT_RESERVATION_SEC 안에 2명이 다 안 모이면 정리한다
         this.clock.setTimeout(() => this.CheckSeatFillTimeout(), constants.SEAT_RESERVATION_SEC * 1000);
@@ -288,6 +289,12 @@ export class GameRoom extends Room {
     // roomId 문자열을 그대로 쓴다 (ENTER_ROOM 의 room 필드와 같은 미확정 사항 — types.ts 참고)
     public GetChannelUserEntries(): AdminChannelUserEntry[] {
         return [...this.players.values()].map((user) => ({ userid: user.userid, room: this.roomId }));
+    }
+
+    // 무중단 재시작 드레인용(index.ts, roomRegistry.CountRoomsInProgress) — 지금 실제로 게임이
+    // 진행 중인지(좌석 채우기/재게임 상대 기다리는 중/게임 종료 후 선택 대기 중 등은 포함하지 않는다).
+    public IsGameInProgress(): boolean {
+        return this.game_started && !this.game_over;
     }
 
     // 로비가 F5 등으로 다시 들어온 유저를 이 방으로 재접속시킬 수 있도록, "이 userid 는 지금 이 방에

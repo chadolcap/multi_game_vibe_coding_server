@@ -32,6 +32,28 @@ function GetHeartbeatKey(channel_type: ChannelType, channel_no: number): string 
     return `channel:${channel_type}:${channel_no}:alive`;
 }
 
+function GetClosingKey(channel_type: ChannelType, channel_no: number): string {
+    return `channel:${channel_type}:${channel_no}:closing`;
+}
+
+// 무중단 재시작(드레인, Phase 9) — 이 채널을 "닫는 중"으로 표시한다. GameRoomMatcher 가 새 방을 만들거나
+// "기다리는 방"에 새 상대를 넣을 때 이 표시가 있는 채널은 건너뛴다. index.ts 의 server.onBeforeShutdown
+// 에서 호출한다(게임 채널만 — 로비는 끊기면 다른 로비로 재접속하면 되므로 드레인이 필요 없다).
+export async function MarkChannelClosing(channel_type: ChannelType, channel_no: number): Promise<void> {
+    await redis.GetRedisClient().set(GetClosingKey(channel_type, channel_no), "1", "EX", constants.CHANNEL_CLOSING_TTL_SEC);
+}
+
+// 채널이 새로 기동될 때(index.ts) 호출해서, 이전 생애의 "닫는 중" 표시가 남아 있지 않게 한다 —
+// TTL 만 믿으면 재시작이 TTL 보다 빠를 때 새 프로세스가 곧바로 "닫는 중"으로 오인될 수 있다.
+export async function ClearChannelClosing(channel_type: ChannelType, channel_no: number): Promise<void> {
+    await redis.GetRedisClient().del(GetClosingKey(channel_type, channel_no));
+}
+
+export async function IsChannelClosing(channel_type: ChannelType, channel_no: number): Promise<boolean> {
+    const value = await redis.GetRedisClient().get(GetClosingKey(channel_type, channel_no));
+    return value !== null;
+}
+
 // 채널 프로세스가 기동될 때(server.listen() 이후) 한 번 호출한다. CHANNEL_HEARTBEAT_INTERVAL_SEC 마다
 // TTL(CHANNEL_HEARTBEAT_TTL_SEC)을 다시 걸어 "살아있음"을 계속 표시한다. 값 자체를 이 프로세스의
 // processId 로 저장해서, SelectProcessIdForRoom 이 "이 채널은 정확히 어느 프로세스가 맡고 있는지"

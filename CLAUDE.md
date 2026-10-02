@@ -209,7 +209,7 @@ src/
     channelNames.ts           채널 ID / 룸 이름 / 포트 규칙 (lobby_N, game_N — 채널 ID 는 종류별로 1부터)
     messages.ts               메시지 송수신 헬퍼 (SendMessage / SendError / SendResult / ReadPayload)
     log.ts                    접속/퇴장 + C↔S 메시지 로그 헬퍼 (RegisterLoggedMessage, phone 마스킹 + 통계성 메시지 payload 생략)
-    roomRegistry.ts           이 프로세스에 살아있는 Room 등록/조회 (SEND_NOTICE 브로드캐스트 + 채널 유저 리포터용)
+    roomRegistry.ts           이 프로세스에 살아있는 Room 등록/조회 (SEND_NOTICE 브로드캐스트 + 채널 유저 리포터 + 무중단 재시작 드레인용)
     nameFilter.ts             별명 형식 검사 + 금칙어 필터 (BANNED_WORDS 는 최소 예시, 운영 전 교체 필요)
     userid.ts                 (partner, mid) → userid 변환 + partner/mid/gender/phone 형식 검사
     types.ts                  메시지 타입/envelope/공통 타입 — 프로토콜의 단일 진실 공급원
@@ -266,7 +266,9 @@ scripts/
 **`game/room/GameRoomMatcher.ts`** — (로비 프로세스 안에서 동작) 채널 선택 + `matchMaker.createRoom`/
 `reserveSeatFor` 로 2명을 게임방에 입장시킨다. "기다리는 방"이 있으면 그쪽을 먼저 채운다. 새 방을 만들
 채널은 `db/channelHeartbeat.ts` 의 `GetAliveGameChannels()` 로 "지금 켜져 있는 채널"만 골라서 시도한다.
-`TryReconnectToGame()` 으로 `activeGame.ts` 기록이 아직 유효한지도 확인한다(F5 재접속).
+`TryReconnectToGame()` 으로 `activeGame.ts` 기록이 아직 유효한지도 확인한다(F5 재접속). 무중단 재시작
+드레인 중인(`IsChannelClosing`) 채널은 켜져 있어도 새 방/기다리는 방 입장 둘 다 건너뛴다(아래
+"무중단 게임 서비스" 참고).
 
 > ⚠️ **부하 테스트로 발견한 매칭 폭주 취약점 (Phase 9, 2026-10-01)**: `LobbyManager.TryMatch()` 가
 > 매칭 쌍을 `while` 루프로 **한 쌍씩 순차 처리**한다 — 101쌍(202명)이 **완전히 동시에** `JOIN_MATCH`
@@ -806,6 +808,51 @@ SelectProcessIdForRoom })` 로 등록.
 
 게임 채널은 이 방식을 안 쓴다 — `GameRoomMatcher` 가 매칭 시 "몇 번 채널까지 있는지"(`GAME_CHANNEL_COUNT`)를
 알아야 하므로 여전히 코드 상수 + 재빌드가 필요하다 (위 "채널 하트비트" 참고).
+
+### 무중단 게임 서비스 — 게임 채널 재시작 중에도 진행 중인 게임이 끊기지 않게 (Phase 9, 2026-10-02)
+
+**문제**: Colyseus 는 SIGINT/SIGTERM 을 받으면(`@colyseus/core` `Server` 생성자가 기본으로 등록하는
+`registerGracefulShutdown`) `matchMaker.gracefullyShutdown()` 을 호출하는데, 이 함수는 **그 프로세스에
+붙어 있는 모든 클라이언트를 즉시 연결 종료**한 뒤 `process.exit()` 한다 — "진행 중인 게임이 끝나길
+기다려 준다" 같은 동작은 전혀 없다(소스 확인). 배포/재시작 때 이대로 두면 한창 게임 중이던 유저도
+그냥 끊긴다.
+
+**해결**: Colyseus 가 공식으로 제공하는 `server.onBeforeShutdown(callback)` 훅을 쓴다 — 이 콜백은
+위의 "클라이언트 전부 끊기" 단계 **이전에** await 되므로, 여기서 시간을 벌 수 있다. **게임 채널에만**
+등록한다(`index.ts`, `channel_type === "game"`) — 로비/Watcher 는 끊겨도 다른 채널로 재접속하면
+되므로 이 복잡한 처리가 필요 없다.
+
+- 콜백이 하는 일: (1) `db/channelHeartbeat.ts` `MarkChannelClosing("game", channel_no)` 로 Redis 에
+"이 채널 닫는 중" 표시(기존 하트비트 `alive` 키와는 별개의 키 `channel:game:{no}:closing`) → (2)
+`index.ts` `WaitUntilGamesFinish()` 가 `CHANNEL_DRAIN_POLL_INTERVAL_SEC`(5초)마다 이 채널에 "진행
+중인 게임"이 몇 개인지 확인하다가 0 이 되면 통과(`CHANNEL_DRAIN_MAX_WAIT_SEC`=10분 넘기면 포기하고
+그냥 종료 진행 — 영원히 재배포를 못 하는 것보단 극단적인 경우 몇 개 끊기는 게 낫다고 판단).
+- "지금 켜져 있는 채널"(`GetAliveGameChannels`, 하트비트)과 "지금 새 일을 받는 채널"(`IsChannelClosing`
+아님)은 **서로 다른 개념**이라 분리했다 — 드레인 중인 채널은 하트비트는 여전히 살아있지만(프로세스가
+아직 안 죽었으므로) 새 방 생성(`GameRoomMatcher.CreateRoomForTwo`)과 "기다리는 방" 입장
+(`TryJoinWaitingRoom`, 큐에서 꺼낸 게 드레인 중인 채널 소속이면 버리고 최대 5번까지 다음 걸 시도)
+둘 다 건너뛴다.
+- **"진행 중인 게임"의 정의가 핵심이다**: `GameRoom.IsGameInProgress()` = `game_started && !game_over`.
+**상대를 기다리는 중인 "기다리는 방"은 진행 중으로 치지 않는다** — 안 그러면 "새 상대를 안 받는다"
+(위에서 막음)와 "그 방이 안 끝났으니 드레인이 못 끝난다"가 서로를 막아 교착상태가 된다. 그래서 그런
+외로운 유저는 채널이 재시작되면 그냥 연결이 끊긴다 — "진행 중인 게임이 끊기지 않게"라는 보장의 범위를
+실제로 플레이 중인 게임으로만 좁힌 의도적인 결정이다(상대를 못 구한 채 대기만 하던 상태는 로비에서
+다시 매칭 걸면 되는 것과 같은 수준으로 취급).
+- `common/roomRegistry.ts` 에 `RegisterRoom` 의 세 번째(옵션) 인자로 `IsGameInProgress` 콜백을 추가해,
+`CountRoomsInProgress(room_name)` 으로 "이 프로세스에서 그 채널에 진행 중인 게임 수"를 센다 —
+기존에 있던 SEND_NOTICE/채널 유저 리포터 용도(1~2번)에 드레인용(3번)이 하나 더 늘었을 뿐, Room
+인스턴스를 추적하는 구조 자체는 그대로다.
+- 채널이 새로 기동될 때마다 이전 생애의 "닫는 중" 표시가 Redis 에 남아 있을 수 있어
+`ClearChannelClosing` 으로 지우고 시작한다(`server.listen()` 이후).
+- **PM2 와의 연동**: `ecosystem.config.cjs` 의 `kill_timeout` 을 12분(드레인 최대 10분 + 여유 2분)으로
+잡아 뒀다 — PM2 kill_timeout 이 더 짧으면 드레인이 끝나기 전에 PM2 가 SIGKILL 을 보내 버려서 이
+기능 전체가 무의미해진다.
+- ⚠️ **Windows 에서 실제로 겪은 제약**: 평범하게 `node dist/index.js game N &` 로 띄운 프로세스에
+bash `kill -SIGINT` 나 `taskkill`(비강제)로 종료 신호를 보내려 하면 실제 SIGINT 로 전달되지 않는다
+(Windows 콘솔 프로세스는 외부 도구가 보낸 신호를 Node 의 `process.on('SIGINT')` 로 못 받는다).
+PM2 로 띄우고 `pm2 stop`/`pm2 restart` 를 쓰면 정상적으로 SIGINT 가 전달된다(PM2 가 같은 Node 생태계의
+IPC 로 신호를 보내기 때문) — 이 기능을 수동으로 테스트/운영하려면 Windows 환경에서는 PM2(또는 같은
+방식의 프로세스 매니저)를 거쳐야 한다.
 
 ### 재접속 / 봇 대체 — 게임 중 연결이 끊겼을 때 (Phase 6)
 

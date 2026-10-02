@@ -13,6 +13,7 @@ import { RedisDriver } from "@colyseus/redis-driver";
 import { config } from "./common/config.js";
 import * as channelNames from "./common/channelNames.js";
 import type { ChannelType } from "./common/channelNames.js";
+import * as constants from "./common/constants.js";
 import * as roomRegistry from "./common/roomRegistry.js";
 import * as channelHeartbeat from "./db/channelHeartbeat.js";
 import * as channelUsers from "./db/channelUsers.js";
@@ -20,6 +21,24 @@ import * as noticePubSub from "./db/noticePubSub.js";
 import { LobbyRoom } from "./game/lobby/LobbyRoom.js";
 import { GameRoom } from "./game/room/GameRoom.js";
 import { WatcherRoom } from "./watch/WatcherRoom.js";
+
+function Sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// 무중단 재시작(드레인, TASKS.md Phase 9) — 이 게임 채널에 진행 중인 게임이 하나도 없어질 때까지
+// 기다린다. CHANNEL_DRAIN_MAX_WAIT_SEC 가 지나도 안 끝나면(드문 경우) 포기하고 그냥 종료를 진행한다 —
+// 영원히 기동 못 하는 것보다, 극단적인 경우 진행 중인 게임 몇 개가 끊기는 쪽이 낫다고 판단했다.
+async function WaitUntilGamesFinish(room_name: string): Promise<void> {
+    const deadline = Date.now() + constants.CHANNEL_DRAIN_MAX_WAIT_SEC * 1000;
+    while (Date.now() < deadline) {
+        const in_progress = roomRegistry.CountRoomsInProgress(room_name);
+        if (in_progress === 0) return;
+        console.log(`[${room_name}] 드레인 대기 중 — 진행 중인 게임 ${in_progress}개`);
+        await Sleep(constants.CHANNEL_DRAIN_POLL_INTERVAL_SEC * 1000);
+    }
+    console.warn(`[${room_name}] 드레인 최대 대기 시간(${constants.CHANNEL_DRAIN_MAX_WAIT_SEC}초)을 넘겨 포기하고 종료를 진행합니다`);
+}
 
 function ParseArgs(): { channel_type: ChannelType; channel_no: number } {
     const [type_arg, no_arg] = process.argv.slice(2);
@@ -83,12 +102,28 @@ async function Main(): Promise<void> {
         server.define(channelNames.GetLobbyRoomName(channel_no), LobbyRoom);
     } else if (channel_type === "game") {
         server.define(channelNames.GetGameRoomName(channel_no), GameRoom);
+
+        // 무중단 재시작(드레인, TASKS.md Phase 9) — 로비는 끊기면 다른 로비로 재접속하면 되므로
+        // 게임 채널만 이 처리가 필요하다. Colyseus 의 기본 SIGINT/SIGTERM 핸들러(registerGracefulShutdown)
+        // 는 onBeforeShutdown 콜백이 끝난 뒤에야 클라이언트를 전부 끊고 process.exit() 한다 — 그 사이에
+        // "새 매칭을 막고 진행 중인 게임이 끝나길 기다리는" 시간을 벌 수 있다.
+        const game_room_name = channelNames.GetGameRoomName(channel_no);
+        server.onBeforeShutdown(async () => {
+            console.log(`[${channel_id}] 재시작/종료 신호 수신 — ${game_room_name} 채널을 닫는 중으로 표시합니다`);
+            await channelHeartbeat.MarkChannelClosing("game", channel_no);
+            await WaitUntilGamesFinish(game_room_name);
+        });
     } else {
         server.define(channelNames.GetWatcherRoomName(), WatcherRoom);
     }
 
     // matchMaker.accept() 가 listen() 안에서 실행되므로, 룸을 미리 만드는 작업은 listen() 이후에 한다
     await server.listen(port);
+
+    if (channel_type === "game") {
+        // 이전 생애(재시작 전)의 "닫는 중" 표시가 남아 있을 수 있으니, 새로 뜰 때마다 지우고 시작한다.
+        await channelHeartbeat.ClearChannelClosing("game", channel_no);
+    }
 
     // 이 채널이 "지금 켜져 있음" + "이 프로세스가 처리한다" 를 Redis 에 표시한다 — 로비가 game_N 채널로
     // 매칭할 때 켜진 채널만 고르는 데(GameRoomMatcher.CreateRoomForTwo) 쓰고, SelectProcessIdForRoom 이
