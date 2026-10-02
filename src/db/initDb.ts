@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import mysql from "mysql2/promise";
 import { config } from "../common/config.js";
-import { EnsureGameLogTable } from "./gameLogSchema.js";
+import * as gameLogSchema from "./gameLogSchema.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -67,7 +67,7 @@ async function ApplySchema(): Promise<void> {
 
 async function EnsureCurrentMonthGameLog(): Promise<void> {
     const { GetDbPool } = await import("./connection.js");
-    const table_name = await EnsureGameLogTable(GetDbPool(), new Date());
+    const table_name = await gameLogSchema.EnsureGameLogTable(GetDbPool(), new Date());
     console.log(`[db:init] 이번 달 게임 로그 테이블 확인/생성 완료: ${table_name}`);
 }
 

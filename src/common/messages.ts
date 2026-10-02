@@ -3,18 +3,19 @@
 // - C→S: 서버는 payload 만 읽는다. (클라이언트는 { payload: {...} } 만 보내도 된다)
 
 import type { Client, Room } from "@colyseus/core";
-import { LogServerMessage } from "./log.js";
-import { MessageType, type Envelope, type ErrorCode, type ErrorPayload } from "./types.js";
+import * as log from "./log.js";
+import * as types from "./types.js";
+import type { Envelope, ErrorCode, ErrorPayload } from "./types.js";
 
 export function SendMessage<P>(room: Room, client: Client, type: string, payload: P): void {
     const envelope: Envelope<P> = { type, payload, ts: Date.now() };
-    LogServerMessage(room, client, type, payload);
+    log.LogServerMessage(room, client, type, payload);
     client.send(type, envelope);
 }
 
 export function SendError(room: Room, client: Client, code: ErrorCode, message: string): void {
     const payload: ErrorPayload = { code, message };
-    SendMessage(room, client, MessageType.ERROR, payload);
+    SendMessage(room, client, types.MessageType.ERROR, payload);
 }
 
 // ENTER_LOBBY / NAME 처럼, 요청과 같은 type 이름으로 { result, error? } 를 돌려주는 응답 헬퍼.

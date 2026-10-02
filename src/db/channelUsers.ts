@@ -3,8 +3,8 @@
 // (ADMIN_CHANNEL_COUNT 는 matchMaker.query() 로 그때그때 실시간 집계하므로 이 스냅샷을 쓰지 않는다 — 그건
 // Colyseus 의 RedisDriver 가 이미 room 생성/삭제마다 자동으로 관리해 주는 값이라 별도 리포트가 필요 없다)
 
-import { GetRedisClient } from "./redis.js";
-import { CHANNEL_USERS_REPORT_INTERVAL_SEC, CHANNEL_USERS_TTL_SEC } from "../common/constants.js";
+import * as redis from "./redis.js";
+import * as constants from "../common/constants.js";
 import type { AdminChannelUserEntry } from "../common/types.js";
 
 function ChannelUsersKey(room_name: string): string {
@@ -12,13 +12,13 @@ function ChannelUsersKey(room_name: string): string {
 }
 
 async function ReportChannelUsers(room_name: string, users: AdminChannelUserEntry[]): Promise<void> {
-    await GetRedisClient().set(ChannelUsersKey(room_name), JSON.stringify(users), "EX", CHANNEL_USERS_TTL_SEC);
+    await redis.GetRedisClient().set(ChannelUsersKey(room_name), JSON.stringify(users), "EX", constants.CHANNEL_USERS_TTL_SEC);
 }
 
 // Watcher 가 ADMIN_CHANNEL_USER 를 처리할 때 읽는다. 값이 없으면(그 채널이 꺼져 있거나, 아직 첫 리포트
 // 전이거나, TTL 이 지났으면) 빈 배열로 취급한다.
 export async function GetChannelUsers(room_name: string): Promise<AdminChannelUserEntry[]> {
-    const raw = await GetRedisClient().get(ChannelUsersKey(room_name));
+    const raw = await redis.GetRedisClient().get(ChannelUsersKey(room_name));
     if (!raw) return [];
     return JSON.parse(raw) as AdminChannelUserEntry[];
 }
@@ -30,5 +30,5 @@ export function StartChannelUsersReporter(room_name: string, getUsers: () => Adm
         ReportChannelUsers(room_name, getUsers()).catch((error) => {
             console.error(`[channelUsers] 리포트 실패 room_name=${room_name}:`, error instanceof Error ? error.message : error);
         });
-    }, CHANNEL_USERS_REPORT_INTERVAL_SEC * 1000);
+    }, constants.CHANNEL_USERS_REPORT_INTERVAL_SEC * 1000);
 }

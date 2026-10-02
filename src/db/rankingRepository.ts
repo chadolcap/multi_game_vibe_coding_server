@@ -6,11 +6,11 @@
 // RANK_DAILY/RANK_WEEKLY 의 날짜 표시(date/term)는 여기서 "YYYY.MM.DD" 로 포맷해서 돌려준다 — 통신규약
 // 시트의 payload 예시(`date:2026.10.01`, `term:{start:2026.09.28, end:2026.10.04}`)가 이 형식이다.
 
-import { RANK_LIST_CACHE_TTL_SEC } from "../common/constants.js";
-import { GetDbPool } from "./connection.js";
-import { GetNamesByUserids } from "./queries/ranking.js";
-import { GetMyRankFromZSet, GetTopRankEntries } from "./rankingZSet.js";
-import { GetJson, SetJson } from "./redis.js";
+import * as constants from "../common/constants.js";
+import * as connection from "./connection.js";
+import * as ranking from "./queries/ranking.js";
+import * as rankingZSet from "./rankingZSet.js";
+import * as redis from "./redis.js";
 import type { RankEntry, RankPeriod } from "./types.js";
 
 function RankListCacheKey(period: RankPeriod): string {
@@ -21,12 +21,12 @@ function RankListCacheKey(period: RankPeriod): string {
 // 순위 번호는 배열 순서(점수 내림차순) 그대로 매긴다 — 이 번호 자체는 클라이언트에 안 나간다
 // (LobbyManager 가 [name, score] 튜플로만 변환해서 보낸다, common/types.ts RankListEntry 참고).
 async function GetCachedRankList(period: RankPeriod): Promise<RankEntry[]> {
-    const cached = await GetJson<RankEntry[]>(RankListCacheKey(period));
+    const cached = await redis.GetJson<RankEntry[]>(RankListCacheKey(period));
     if (cached) return cached;
 
-    const pool = GetDbPool();
-    const top = await GetTopRankEntries(pool, period);
-    const names = await GetNamesByUserids(pool, top.map((entry) => entry.userid));
+    const pool = connection.GetDbPool();
+    const top = await rankingZSet.GetTopRankEntries(pool, period);
+    const names = await ranking.GetNamesByUserids(pool, top.map((entry) => entry.userid));
     const list: RankEntry[] = top.map((entry, index) => ({
         rank: index + 1,
         userid: entry.userid,
@@ -34,7 +34,7 @@ async function GetCachedRankList(period: RankPeriod): Promise<RankEntry[]> {
         score: entry.score,
     }));
 
-    await SetJson(RankListCacheKey(period), list, RANK_LIST_CACHE_TTL_SEC);
+    await redis.SetJson(RankListCacheKey(period), list, constants.RANK_LIST_CACHE_TTL_SEC);
     return list;
 }
 
@@ -71,7 +71,7 @@ export interface RankWeeklyInfo {
 export async function FetchRankDaily(userid: string): Promise<RankDailyInfo> {
     const [rank_list, my] = await Promise.all([
         GetCachedRankList("daily"),
-        GetMyRankFromZSet(GetDbPool(), "daily", userid),
+        rankingZSet.GetMyRankFromZSet(connection.GetDbPool(), "daily", userid),
     ]);
     return { date: FormatDateDot(new Date()), rank_list, my_rank: my.rank, my_score: my.score };
 }
@@ -79,7 +79,7 @@ export async function FetchRankDaily(userid: string): Promise<RankDailyInfo> {
 export async function FetchRankWeekly(userid: string): Promise<RankWeeklyInfo> {
     const [rank_list, my] = await Promise.all([
         GetCachedRankList("weekly"),
-        GetMyRankFromZSet(GetDbPool(), "weekly", userid),
+        rankingZSet.GetMyRankFromZSet(connection.GetDbPool(), "weekly", userid),
     ]);
     const monday = GetThisWeekMonday();
     const sunday = new Date(monday.getFullYear(), monday.getMonth(), monday.getDate() + 6);

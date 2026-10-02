@@ -65,6 +65,33 @@ npm run start:game1     # game_1, 포트 6021
   `ADMIN_LOGIN`/`ADMIN_CHANNEL_COUNT`/`ADMIN_CHANNEL_USER`/`SEND_NOTICE` 를 등록했다.
 - 개발용 Redis 종료는 `Ctrl+C` 대신 `redis-cli -p 6780 SHUTDOWN SAVE` 로 한다 (데이터 저장 후 종료).
 
+**6개 채널을 한 번에 켜고 끄기 (PM2, Phase 9, 2026-10-02)** — 터미널 탭을 6개씩 띄우는 대신
+`ecosystem.config.cjs`(프로젝트 루트) 로 PM2 에 전부 등록해 둘 수 있다.
+
+```powershell
+npm run build                   # 코드가 바뀔 때마다 먼저
+npm run pm2:start:dev           # 지금 정책대로 watcher + lobby_1 + game_1 만
+npm run pm2:start               # 운영 규모 — 6개 채널 전부 (game_2/3 은 GAME_CHANNEL_COUNT 를 먼저 3으로 올려야 함)
+npm run pm2:status              # 채널별 상태(켜짐/재시작 횟수 등)
+npm run pm2:logs                # 전체 로그 스트리밍 (npx pm2 logs game_1 처럼 채널 하나만도 가능)
+npm run pm2:stop                # 전체 정지 (SIGINT → Colyseus graceful shutdown)
+npm run pm2:restart             # 전체 재시작
+npm run pm2:delete              # PM2 관리 목록에서 제거
+```
+
+- `package.json` 이 `"type": "module"` 이라 PM2 설정 파일은 `.cjs`(CommonJS)로 둬야 한다 — PM2 자체가
+  설정을 `require()` 로 읽기 때문. `node dist/index.js <watcher|lobby|game> <채널 번호>` 를 그대로
+  감싸는 형태라 "로컬 실행 방법"에 적힌 채널/포트 규칙과 완전히 동일하게 동작한다.
+- `kill_timeout` 을 60초로 넉넉히 잡아 뒀다 — PM2 기본값(1.6초)은 Colyseus 가 자체적으로 하는 graceful
+  shutdown 이 끝나기도 전에 SIGKILL 로 강제 종료할 수 있다. 다만 "채널 단위로 새 입장을 막고 진행
+  중인 게임이 끝난 뒤 재시작"하는 무중단 로직 자체는 아직 없어서(아래 "무중단 게임 서비스" 참고) 지금은
+  안전 마진 성격의 값이다.
+- 실제로 비어 있던 `lobby_2`(포트 6012) 하나로 기동→포트 리스닝 확인→`pm2 stop`(graceful, 포트 해제
+  확인)→`pm2 delete`까지 검증했다. 이미 떠 있던 다른 채널에는 영향이 없었다.
+- ⚠️ `pm2` 설치 시 `npm audit` 이 high severity 취약점을 보고하는데, 둘 다 PM2 의 `pm2 deploy`(SSH
+  배포) 기능이 쓰는 `pac-proxy-agent`/`js-yaml` 쪽이다 — 이 프로젝트는 그 기능을 쓰지 않으므로 당장
+  위험은 낮다고 판단해 보류했다(수정하려면 `pm2@5.3.1` 로 내려가야 해서 breaking change).
+
 
 
 ### 포트가 이미 사용 중일 때 (`EADDRINUSE`)
@@ -150,7 +177,7 @@ src/
       LobbyManager.ts         ENTER_LOBBY/NAME/PLAY_INFO/RANK_DAILY/RANK_WEEKLY/JOIN_MATCH 처리 + REJOIN_GAME 안내 — 아래 설명 참고
       LobbyRoom.ts            소켓 이벤트를 LobbyManager 에 위임, ENTER_TIMEOUT/CHANNEL_FULL 검사
     room/
-      RoomManager.ts          매칭/방 생성/"기다리는 방"/재접속 확인 — 아래 설명 참고
+      GameRoomMatcher.ts      매칭/방 생성/"기다리는 방"/재접속 확인 — 아래 설명 참고
       GameRoom.ts             가위바위보 게임 로직 전체 — 아래 설명 참고 (가장 큰 파일)
       waitingRooms.ts         "기다리는 방" 목록 (Redis LIST, RPUSH/LPOP 원자적)
       activeGame.ts           "userid → 게임 중인 방" 기록 (Redis, F5 재접속용) — 아래 설명 참고
@@ -181,7 +208,7 @@ src/
     constants.ts              규모 스펙/게임 규칙 상수
     channelNames.ts           채널 ID / 룸 이름 / 포트 규칙 (lobby_N, game_N — 채널 ID 는 종류별로 1부터)
     messages.ts               메시지 송수신 헬퍼 (SendMessage / SendError / SendResult / ReadPayload)
-    log.ts                    접속/퇴장 + C↔S 메시지 로그 헬퍼 (RegisterLoggedMessage)
+    log.ts                    접속/퇴장 + C↔S 메시지 로그 헬퍼 (RegisterLoggedMessage, phone 마스킹 + 통계성 메시지 payload 생략)
     roomRegistry.ts           이 프로세스에 살아있는 Room 등록/조회 (SEND_NOTICE 브로드캐스트 + 채널 유저 리포터용)
     nameFilter.ts             별명 형식 검사 + 금칙어 필터 (BANNED_WORDS 는 최소 예시, 운영 전 교체 필요)
     userid.ts                 (partner, mid) → userid 변환 + partner/mid/gender/phone 형식 검사
@@ -232,11 +259,11 @@ scripts/
   커넥션을 따로 둔다.
 
 **`game/lobby/LobbyManager.ts`** — `ENTER_LOBBY` 처리(형식 검사 → `userRepository` 조회/등록 → 대기 목록),
-`NAME`(별명 등록) 처리. `JOIN_MATCH` 대기열(`match_queue`)을 관리하고, `RoomManager` 를 불러 매칭 성사 시
+`NAME`(별명 등록) 처리. `JOIN_MATCH` 대기열(`match_queue`)을 관리하고, `GameRoomMatcher` 를 불러 매칭 성사 시
 `MATCH_FOUND` 를 보낸다. `ENTER_LOBBY` 성공 직후 `activeGame.ts` 로 "게임 중인지" 확인해서, 맞으면 평범한
 대기 등록 대신 `REJOIN_GAME` 을 보낸다(Phase 6-1, F5 재접속 — "F5 재접속" 참고).
 
-**`game/room/RoomManager.ts`** — (로비 프로세스 안에서 동작) 채널 선택 + `matchMaker.createRoom`/
+**`game/room/GameRoomMatcher.ts`** — (로비 프로세스 안에서 동작) 채널 선택 + `matchMaker.createRoom`/
 `reserveSeatFor` 로 2명을 게임방에 입장시킨다. "기다리는 방"이 있으면 그쪽을 먼저 채운다. 새 방을 만들
 채널은 `db/channelHeartbeat.ts` 의 `GetAliveGameChannels()` 로 "지금 켜져 있는 채널"만 골라서 시도한다.
 `TryReconnectToGame()` 으로 `activeGame.ts` 기록이 아직 유효한지도 확인한다(F5 재접속).
@@ -264,7 +291,7 @@ scripts/
   판정, 무승부 재진행, 2선승제, 10초 선택 시간 초과 자동 선택
 - `GAME_RESULT{replay:"Y"}` 재게임 응답 — 10초 무응답=나가기, 둘 다 재게임=같은 방에서 재시작, 한 명만
   재게임="기다리는 방" 등록 후 새 상대와 `ENTER_ROOM` 부터 재진행(`waitingRooms.ts`/
-  `RoomManager.TryJoinWaitingRoom` 과 연동)
+  `GameRoomMatcher.TryJoinWaitingRoom` 과 연동)
 - 게임 끝날 때마다 결과 DB 반영(`db/gameResultRepository.ts` 호출 — `user_play_info`, `rank_daily`/
   `rank_weekly`, `game_log_YYYY_MM` 저장 + Redis 캐시 write-through, 게임방 메모리의 플레이어 정보도 최신화)
 - 게임 중 연결 끊김 재접속 유예(`onDrop`, `allowReconnection("manual")`) + 5초 뒤 봇 투입(`bot_sessions` —
@@ -287,7 +314,7 @@ scripts/
 로비가 `ENTER_LOBBY` 때 이 값으로 `REJOIN_GAME` 안내 여부를 판단한다("F5 재접속" 참고).
 
 **`db/channelHeartbeat.ts`** — 채널이 지금 켜져 있는지 + 어느 `processId` 가 처리하는지 Redis TTL 로 표시
-(`StartChannelHeartbeat`, `index.ts` 가 기동 시 호출) + 조회(`GetAliveGameChannels`, `RoomManager` 가 매칭할
+(`StartChannelHeartbeat`, `index.ts` 가 기동 시 호출) + 조회(`GetAliveGameChannels`, `GameRoomMatcher` 가 매칭할
 때 씀) + `SelectProcessIdForRoom`(`index.ts` 의 `new Server({ selectProcessIdToCreateRoom })` 로 등록 —
 Colyseus 기본 라우팅이 룸 타입을 안 보고 로드만 보는 문제를 막는다, "방 생성이 엉뚱한 프로세스로
 라우팅되는 문제" 참고). Colyseus 자체에는 "어떤 프로세스가 어떤 룸 이름을 처리하는지" 조회할 방법이
@@ -356,7 +383,7 @@ MySQL(날짜별 PK)과 똑같이 저절로 처리된다.
 - Colyseus 룸 이름은 채널마다 따로 등록하며, 채널별 통계도 이 이름으로 구분한다.
   - 로비 룸: `lobby_1`, `lobby_2` — 채널당 **1개**, 서버 기동 시(`index.ts`) `matchMaker.createRoom()` 으로 미리 생성 (`autoDispose=false`)
     - `matchMaker.createRoom()` 은 `server.listen()` **이후**에 호출해야 한다 (`matchMaker.accept()` 가 `listen()` 안에서 실행됨)
-  - 게임 룸: `game_1`, `game_2`, `game_3` — 채널당 최대 100개, RoomManager 가 필요할 때 생성 (Phase 4)
+  - 게임 룸: `game_1`, `game_2`, `game_3` — 채널당 최대 100개, GameRoomMatcher 가 필요할 때 생성 (Phase 4)
 - 클라이언트에서 로비 소켓 접속(2개의 채널에 랜덤하게)  -> 로비 접속 후 게임 참여 버튼 -> 서버에서 룸채널에서 참여 가능한 채널 정보를 정보 전달 -> 로비 소켓 끊고 -> 받은 정보의 소켓 연결
 - 클라이언트 연결은 **이동형**: 로비 룸에 접속 → 매칭되면 로비를 떠나 게임 룸으로 이동 → 종료 후 로비로 복귀. (연결은 항상 1개)
 
@@ -483,6 +510,13 @@ MySQL(날짜별 PK)과 똑같이 저절로 처리된다.
     가위바위보 값도 계속 기록한다.
   - 무승부 판은 **개수 제한 없이** 모두 기록한다. 판 수가 정해져 있지 않으므로 play1~playN 고정 컬럼 대신
   **plays 컬럼 하나(JSON 배열)** 에 무승부 판을 포함한 모든 판을 순서대로 저장한다.
+  - **plays 각 판의 형식(2026-10-02 변경)**: `[{ "userid1": "가위", "userid2": "보" }, ...]` — userid →
+    그 유저가 낸 값. 승패는 위 `win`/`lose`/`vs` 컬럼으로 이미 알 수 있어서, 예전처럼 `{win:"가위",
+    lose:"보"}`/`{draw:"가위"}` 식으로 승/패/무 역할만 기록하면 "누가(어떤 userid가) 그 값을 냈는지"를
+    알 수 없어 기록으로서 가치가 없었다(사용자 지적) — userid 기준으로 바꿔서 매 판 누가 무엇을 냈는지
+    그대로 알 수 있게 했다. ⚠️ **이 변경은 새로 쓰는 로그부터만 적용된다** — 이미 쌓인 과거
+    `game_log_YYYY_MM` 로우의 `plays` 는 옛 형식(`win`/`lose`/`draw` 키) 그대로 남아 있으므로, 과거
+    데이터를 분석할 때는 두 형식이 섞여 있다는 걸 유의할 것(별도 마이그레이션은 하지 않음).
 - rank_weekly (주간 랭킹 테이블/월요일 리셋/date_start 로 주간별 정보 체크) : date_start, userid, score
 - rank_daily (일일 랭킹 테이블) : date_game, userid, score
 
@@ -676,7 +710,7 @@ ENTER_LOBBY / NAME 은 통신 정리 문서(위 링크) 기준. 나머지는 이
 클라이언트가 그 값을 직접 읽어 새 `Client` 를 만들어 접속하는 방식. **사용자가 나중에 이 방식으로 바꿀 수도 있다고
 명시적으로 요청했다** — 바꾸게 되면:
 
-- `MatchFoundPayload` 에 `ip`, `port` 필드를 추가하고 (`common/types.ts`), `RoomManager` 가 이 값을 채워서 보내야 한다
+- `MatchFoundPayload` 에 `ip`, `port` 필드를 추가하고 (`common/types.ts`), `GameRoomMatcher` 가 이 값을 채워서 보내야 한다
 (게임 채널의 `publicAddress`/포트 정보를 그대로 활용하면 된다 — 이미 A안에서 채워 둔 값을 재사용 가능).
 - 클라이언트는 더 이상 `consumeSeatReservation()` 을 안 쓰므로, 방에 들어온 클라이언트가 "나 누구다"를 서버에 알리는
 별도 방법이 필요하다 (예: 접속 직후 별도 메시지로 userid 를 실어 보내고 GameRoom 이 Redis/DB 로 확인하는 등).
@@ -706,7 +740,7 @@ matchMaker.processId)` 를 호출한다(`index.ts`, 최초 1회는 완료를 기
 `processId`). 프로세스가 죽으면(정상 종료든 크래시든) 갱신이 멈추고 최대 15초 뒤 키가 자동으로
 사라진다 — 종료 시그널을 따로 잡아 지우지 않는다(Colyseus 가 이미 자체적으로 `SIGINT`/`SIGTERM` 을
 잡아 graceful shutdown 을 하므로, 여기서 또 잡아 `process.exit()` 를 부르면 그 흐름과 경합할 수 있다).
-- `RoomManager.CreateRoomForTwo` 는 새 방을 만들 채널을 고를 때 `1..GAME_CHANNEL_COUNT` 를 무조건 순회하지 않고,
+- `GameRoomMatcher.CreateRoomForTwo` 는 새 방을 만들 채널을 고를 때 `1..GAME_CHANNEL_COUNT` 를 무조건 순회하지 않고,
 `GetAliveGameChannels(GAME_CHANNEL_COUNT)` 로 **지금 하트비트가 살아있는 채널 번호만** 가져와 그 순서대로
 시도한다. 켜진 채널이 하나도 없으면(하트비트가 전부 만료) `NO_GAME_ROOM` 으로 곧장 응답한다.
 - "기다리는 방"(`waitingRooms.ts`) 쪽은 이 하트비트를 안 쓴다 — 이미 존재하는 특정 room_id 를 조회하는
@@ -770,7 +804,7 @@ SelectProcessIdForRoom })` 로 등록.
 약속돼 있는 값이라(규모 스펙 참고), **클라이언트가 새 포트를 접속 후보 목록에 알아야 실제로 그 채널에
 사용자가 들어온다** — 이 부분은 클라이언트 쪽에서 처리하기로 결정함(서버는 채널을 여는 것까지만 책임진다).
 
-게임 채널은 이 방식을 안 쓴다 — `RoomManager` 가 매칭 시 "몇 번 채널까지 있는지"(`GAME_CHANNEL_COUNT`)를
+게임 채널은 이 방식을 안 쓴다 — `GameRoomMatcher` 가 매칭 시 "몇 번 채널까지 있는지"(`GAME_CHANNEL_COUNT`)를
 알아야 하므로 여전히 코드 상수 + 재빌드가 필요하다 (위 "채널 하트비트" 참고).
 
 ### 재접속 / 봇 대체 — 게임 중 연결이 끊겼을 때 (Phase 6)
@@ -836,6 +870,20 @@ reject)하면 그때서야 `onLeave()` 가 불린다 — 재접속에 성공하�
 
 ## 코딩 컨벤션
 
+- **내부 모듈(상대 경로 import) 간 함수/상수 import 는 네임스페이스 스타일로 쓴다** —
+  `import { SendResult } from "./messages.js"` 대신 `import * as messages from "./messages.js"` 로
+  받아서 호출부에서 `messages.SendResult(...)` 처럼 모듈 이름을 접두어로 붙인다(2026-10-02 사용자 요청 —
+  호출부만 봐도 어느 모듈 함수인지 바로 알 수 있어 가독성이 좋다는 이유). **타입**(`import type {...}`,
+  혼합 import 안의 `type X` 항목)과 **클래스**(`GameRoomMatcher`, `LobbyManager`, `LobbyRoom`, `GameRoom`,
+  `WatcherManager`, `WatcherRoom` 등 `new X()`/`extends X` 로 쓰는 것)는 예외 — 지금처럼 이름 그대로
+  import 한다. npm 패키지(`@colyseus/core`, `ioredis`, `mysql2/promise` 등) import 도 대상이 아니다.
+  alias 이름은 보통 모듈 파일명 그대로 쓰지만, 그 파일 안에 같은 이름의 지역 변수/매개변수가 이미 많이
+  쓰이고 있으면(예: `userid` 를 변수로 많이 쓰는 파일에서 `common/userid.js` 를 import 할 때)
+  충돌(섀도잉)을 피하려고 `useridUtils` 처럼 다른 이름을 쓴다(`db/userRepository.ts`,
+  `game/lobby/LobbyManager.ts` 참고). **`config.ts` 는 예외** — `config` 라는 값 하나만 export 해서
+  네임스페이스로 바꾸면 `config.config.xxx` 처럼 이중 접두어가 되어 가독성에 도움이 안 된다(처음엔
+  일관성을 위해 그대로 적용했었는데, 2026-10-02 다시 확인 후 `config.ts` 만은 원래 방식(`import { config }
+  from "./config.js"`, 호출부 `config.xxx`)으로 되돌렸다).
 - ⚠️ **문서(엑셀본/구글 시트)에 있는 C→S 메시지는 반드시** `RoomMessages`**(**`RegisterLoggedMessage`**)로** `onMessage` **등록해야
 한다.** 등록하지 않은 메시지가 오면 Colyseus 가 `isDevMode`(기본 `false`) 기준으로 `client.leave(CloseCode.WITH_ERROR)`
 로 **그 자리에서 연결을 끊는다** — 에러 응답이 오는 게 아니라 그냥 조용히 끊긴다. `PLAY_INFO`(Phase 3)와
@@ -853,7 +901,7 @@ reject)하면 그때서야 `onLeave()` 가 불린다 — 재접속에 성공하�
 `GameRoom.FinishGame()` 이 `this.plays`(이번 게임의 판 기록 배열)를 그대로 `SaveGameResult({ plays: this.plays })`
 에 넘겼는데, 그 DB 저장이 끝나기 전에 클라이언트가 재게임을 선택해 `StartGame()` 이 다시 불리면서 `this.plays` 를
 비워버려, DB 에는 빈 배열이 저장됐다. **해결**: `plays: [...this.plays]` 처럼 **호출하는 그 순간 복사본**을 넘길 것.
-- WatcherManager / LobbyManager / RoomManager는 역할을 분리하고 서로 직접 DB 쿼리를 하지 않는다. DB 접근은 반드시 `db/` 모듈을 통한다.
+- WatcherManager / LobbyManager / GameRoomMatcher는 역할을 분리하고 서로 직접 DB 쿼리를 하지 않는다. DB 접근은 반드시 `db/` 모듈을 통한다.
 - DB/Redis 접속 정보는 `.env`로 관리하고 코드에 하드코딩하지 않는다.
 - 연결 종료/재접속 시나리오를 각 매니저에서 반드시 고려한다.
 - 1차 구현은 `partner + mid` 만으로 유저를 식별한다 (별도 인증 없음). 파트너사 토큰 검증은 추후 추가하므로,

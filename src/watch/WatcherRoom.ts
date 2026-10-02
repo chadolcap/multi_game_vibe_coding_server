@@ -4,16 +4,11 @@
 
 import { Room, CloseCode, type Client } from "@colyseus/core";
 import type { Delayed } from "@colyseus/timer";
-import { ADMIN_LOGIN_TIMEOUT_SEC } from "../common/constants.js";
-import { LogConnect, LogDisconnect, RegisterLoggedMessage } from "../common/log.js";
-import { SendError } from "../common/messages.js";
-import {
-    ErrorCode,
-    MessageType,
-    type AdminChannelUserQuery,
-    type AdminLoginPayload,
-    type SendNoticePayload,
-} from "../common/types.js";
+import * as constants from "../common/constants.js";
+import * as log from "../common/log.js";
+import * as messages from "../common/messages.js";
+import * as types from "../common/types.js";
+import type { AdminChannelUserQuery, AdminLoginPayload, SendNoticePayload } from "../common/types.js";
 import { WatcherManager } from "./WatcherManager.js";
 
 export class WatcherRoom extends Room {
@@ -27,40 +22,40 @@ export class WatcherRoom extends Room {
     public onCreate(): void {
         console.log(`[WatcherRoom] 생성됨 roomName=${this.roomName} roomId=${this.roomId}`);
 
-        RegisterLoggedMessage<AdminLoginPayload>(this, MessageType.ADMIN_LOGIN, (client, message) => {
+        log.RegisterLoggedMessage<AdminLoginPayload>(this, types.MessageType.ADMIN_LOGIN, (client, message) => {
             const success = this.manager.HandleAdminLogin(client, message);
             if (success) this.ClearLoginTimeout(client.sessionId);
         });
 
-        RegisterLoggedMessage(this, MessageType.ADMIN_CHANNEL_COUNT, async (client) => {
+        log.RegisterLoggedMessage(this, types.MessageType.ADMIN_CHANNEL_COUNT, async (client) => {
             await this.manager.HandleChannelCount(client);
         });
 
-        RegisterLoggedMessage<AdminChannelUserQuery>(this, MessageType.ADMIN_CHANNEL_USER, async (client, message) => {
+        log.RegisterLoggedMessage<AdminChannelUserQuery>(this, types.MessageType.ADMIN_CHANNEL_USER, async (client, message) => {
             await this.manager.HandleChannelUser(client, message);
         });
 
-        RegisterLoggedMessage<SendNoticePayload>(this, MessageType.SEND_NOTICE, async (client, message) => {
+        log.RegisterLoggedMessage<SendNoticePayload>(this, types.MessageType.SEND_NOTICE, async (client, message) => {
             await this.manager.HandleSendNotice(client, message);
         });
     }
 
     public onJoin(client: Client): void {
-        LogConnect(this, client);
+        log.LogConnect(this, client);
 
         // ⚠️ LobbyRoom 의 ENTER_LOBBY 타임아웃과 같은 이유로, 여기서 바로 client.leave() 하지 않고 타이머만
         // 건다 — onJoin 안에서는 클라이언트가 JOIN_ROOM 핸드셰이크를 마치기 전이라 서버가 보낸 메시지가
         // 실제로 전달되지 않는다 (CLAUDE.md 코딩 컨벤션 참고). 타임아웃 자체는 ADMIN_LOGIN 을 기다리는
         // 것이므로 이 타이머가 만료될 때 보내는 ERROR 는 핸드셰이크가 끝난 뒤라 문제없다.
         const timer = this.clock.setTimeout(() => {
-            SendError(this, client, ErrorCode.ENTER_TIMEOUT, "제한 시간 안에 ADMIN_LOGIN 을 보내지 않았습니다.");
+            messages.SendError(this, client, types.ErrorCode.ENTER_TIMEOUT, "제한 시간 안에 ADMIN_LOGIN 을 보내지 않았습니다.");
             client.leave(CloseCode.WITH_ERROR);
-        }, ADMIN_LOGIN_TIMEOUT_SEC * 1000);
+        }, constants.ADMIN_LOGIN_TIMEOUT_SEC * 1000);
         this.login_timeout_timers.set(client.sessionId, timer);
     }
 
     public onLeave(client: Client, code?: number): void {
-        LogDisconnect(this, client, code);
+        log.LogDisconnect(this, client, code);
         this.ClearLoginTimeout(client.sessionId);
         this.manager.HandleLeave(client);
     }

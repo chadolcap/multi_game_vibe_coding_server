@@ -2,7 +2,7 @@
 // 기존 유저의 phone 갱신 쿼리도 여기서 함께 다룬다.
 
 import type { Pool } from "mysql2/promise";
-import { GetDefaultAvatar } from "../../common/userid.js";
+import * as userid from "../../common/userid.js";
 import type { NewUserInput } from "../types.js";
 
 // user_partner_info / user_member_info / user_play_info 에 기본 정보를 넣는다.
@@ -20,7 +20,7 @@ export async function RegisterNewUser(pool: Pool, input: NewUserInput): Promise<
         // 아바타는 성별 기본값으로 정한다 (M → a_m_0, F → a_f_0). 나중에 유저가 직접 바꿀 수 있다.
         await connection.query(
             "INSERT IGNORE INTO user_member_info (userid, avatar, phone) VALUES (?, ?, ?)",
-            [input.userid, GetDefaultAvatar(input.gender), input.phone]
+            [input.userid, userid.GetDefaultAvatar(input.gender), input.phone]
         );
         await connection.query(
             "INSERT IGNORE INTO user_play_info (userid, today_date) VALUES (?, CURDATE())",

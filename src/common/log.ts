@@ -4,6 +4,7 @@
 // 색이 안 보이는 터미널이어도 [C→S] / [S→C] 텍스트 자체로 구분되도록 한다.
 
 import type { Client, Room } from "@colyseus/core";
+import * as types from "./types.js";
 
 const RESET = "\x1b[0m";
 const CYAN = "\x1b[36m"; // 접속
@@ -22,8 +23,21 @@ export function MaskPhone(phone: unknown): string {
     return phone.length <= 4 ? "*".repeat(phone.length) : `${"*".repeat(phone.length - 4)}${phone.slice(-4)}`;
 }
 
-// payload 를 로그용 문자열로 변환한다. phone 필드(중첩 포함)는 자동으로 마스킹하고, 너무 길면 자른다.
-function StringifyPayload(payload: unknown, max = 500): string {
+// 통계/순위 데이터가 담기는 메시지 — 그대로 로그에 남기면(특히 외부로 전달되는 로그 수집기 등을 통해)
+// 유저 개개인의 플레이 기록·순위가 유출될 수 있어 payload 자체를 생략한다.
+// (사용자 전역 보안 규칙: "통계등 자료에 대한 유출 절대 금지")
+const STATS_MESSAGE_TYPES = new Set<string>([
+    types.MessageType.PLAY_INFO,
+    types.MessageType.RANK_DAILY,
+    types.MessageType.RANK_WEEKLY,
+    types.MessageType.GAME_RESULT,
+]);
+
+// payload 를 로그용 문자열로 변환한다. 통계성 메시지(위 STATS_MESSAGE_TYPES)는 payload 를 생략하고,
+// 그 외에는 phone 필드(중첩 포함)를 자동으로 마스킹한 뒤 너무 길면 자른다.
+function StringifyPayload(type: string | undefined, payload: unknown, max = 500): string {
+    if (type !== undefined && STATS_MESSAGE_TYPES.has(type)) return "[통계 데이터 생략]";
+
     let text: string;
     try {
         text = JSON.stringify(payload, (key, value) => (key === "phone" ? MaskPhone(value) : value)) ?? String(payload);
@@ -34,7 +48,7 @@ function StringifyPayload(payload: unknown, max = 500): string {
 }
 
 export function LogConnect(room: Room, client: Client, extra?: unknown): void {
-    const extra_text = extra !== undefined ? ` ${StringifyPayload(extra)}` : "";
+    const extra_text = extra !== undefined ? ` ${StringifyPayload(undefined, extra)}` : "";
     console.log(
         `${CYAN}[접속]${RESET} ${RoomTag(room)} sessionId=${client.sessionId} (현재 ${room.clients.length}명)${extra_text}`
     );
@@ -47,14 +61,14 @@ export function LogDisconnect(room: Room, client: Client, code?: number): void {
 // 클라이언트 → 서버로 받은 메시지 (C→S)
 export function LogClientMessage(room: Room, client: Client, type: string, payload: unknown): void {
     console.log(
-        `${GREEN}[C→S]${RESET} ${RoomTag(room)} sessionId=${client.sessionId} type=${type} payload=${StringifyPayload(payload)}`
+        `${GREEN}[C→S]${RESET} ${RoomTag(room)} sessionId=${client.sessionId} type=${type} payload=${StringifyPayload(type, payload)}`
     );
 }
 
 // 서버 → 클라이언트로 보낸 메시지 (S→C)
 export function LogServerMessage(room: Room, client: Client, type: string, payload: unknown): void {
     console.log(
-        `${MAGENTA}[S→C]${RESET} ${RoomTag(room)} sessionId=${client.sessionId} type=${type} payload=${StringifyPayload(payload)}`
+        `${MAGENTA}[S→C]${RESET} ${RoomTag(room)} sessionId=${client.sessionId} type=${type} payload=${StringifyPayload(type, payload)}`
     );
 }
 

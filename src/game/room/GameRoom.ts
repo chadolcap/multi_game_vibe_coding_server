@@ -2,42 +2,34 @@
 // Phase 4 에서는 "좌석 예약으로만 입장 가능한 잠긴 방"과 "10초 안에 2명이 안 모이면 정리" 만 다룬다.
 
 import { Room, CloseCode, type Client, type Deferred, type Delayed } from "@colyseus/core";
-import { ParseGameChannelNo } from "../../common/channelNames.js";
-import {
-    CHOICE_TIMEOUT_SEC,
-    GAME_START_DELAY_SEC,
-    ONE_RESULT_DELAY_SEC,
-    PLAYERS_PER_ROOM,
-    RECONNECT_WAIT_SEC,
-    REMATCH_CHOICE_TIMEOUT_SEC,
-    SEAT_RESERVATION_SEC,
-    WIN_COUNT_TO_FINISH,
-} from "../../common/constants.js";
-import { LogConnect, LogDisconnect, RegisterLoggedMessage } from "../../common/log.js";
-import { SendMessage } from "../../common/messages.js";
-import {
-    MessageType,
-    type AdminChannelUserEntry,
-    type Choice,
-    type EnterRoomPayload,
-    type GameResultPayload,
-    type GameSeatAuth,
-    type OneRemainTimePayload,
-    type OneResultPayload,
-    type OneStartPayload,
-    type OpponentJoinedPayload,
-    type OutUserPayload,
-    type ReadyPayload,
-    type ReplayPayload,
-    type RoomPlayerInfo,
-    type SelectGamePayload,
-    type UserInfo,
+import * as channelNames from "../../common/channelNames.js";
+import * as constants from "../../common/constants.js";
+import * as log from "../../common/log.js";
+import * as messages from "../../common/messages.js";
+import * as types from "../../common/types.js";
+import type {
+    AdminChannelUserEntry,
+    Choice,
+    EnterRoomPayload,
+    GameResultPayload,
+    GameSeatAuth,
+    OneRemainTimePayload,
+    OneResultPayload,
+    OneStartPayload,
+    OpponentJoinedPayload,
+    OutUserPayload,
+    ReadyPayload,
+    ReplayPayload,
+    RoomPlayerInfo,
+    SelectGamePayload,
+    UserInfo,
 } from "../../common/types.js";
-import { RegisterRoom, UnregisterRoom } from "../../common/roomRegistry.js";
-import { SaveGameResult, type PlayRecord } from "../../db/gameResultRepository.js";
-import { GetUserCache, TouchUserCache } from "../../db/userCache.js";
-import { RemoveActiveGame, SaveActiveGame } from "./activeGame.js";
-import { PushWaitingRoom, RemoveWaitingRoom } from "./waitingRooms.js";
+import * as roomRegistry from "../../common/roomRegistry.js";
+import * as gameResultRepository from "../../db/gameResultRepository.js";
+import type { PlayRecord } from "../../db/gameResultRepository.js";
+import * as userCache from "../../db/userCache.js";
+import * as activeGame from "./activeGame.js";
+import * as waitingRooms from "./waitingRooms.js";
 import type { ActiveGameEntry, WaitingRoomEntry } from "./types.js";
 
 // total_win_count / total_game_count 기준 승률 (0~100 정수). 한 판도 안 한 유저는 0.
@@ -66,7 +58,7 @@ function JudgeChoice(a: Choice, b: Choice): number {
 }
 
 export class GameRoom extends Room {
-    maxClients = PLAYERS_PER_ROOM;
+    maxClients = constants.PLAYERS_PER_ROOM;
 
     // sessionId → 좌석 예약에 담겨 온 유저 정보 (Redis/DB 조회 없이 바로 사용).
     // Map 은 입력 순서를 유지하므로, ENTER_ROOM 의 player1/player2 순서(먼저 입장한 쪽이 player1)를
@@ -124,28 +116,28 @@ export class GameRoom extends Room {
         console.log(`[GameRoom] 생성됨 roomName=${this.roomName} roomId=${this.roomId}`);
 
         // SEND_NOTICE 브로드캐스트 + 채널 유저 리포터(Watcher 의 ADMIN_CHANNEL_USER 용)가 이 방을 찾을 수 있도록 등록
-        RegisterRoom(this, () => this.GetChannelUserEntries());
+        roomRegistry.RegisterRoom(this, () => this.GetChannelUserEntries());
 
         // 좌석 예약 후 SEAT_RESERVATION_SEC 안에 2명이 다 안 모이면 정리한다
-        this.clock.setTimeout(() => this.CheckSeatFillTimeout(), SEAT_RESERVATION_SEC * 1000);
+        this.clock.setTimeout(() => this.CheckSeatFillTimeout(), constants.SEAT_RESERVATION_SEC * 1000);
 
-        RegisterLoggedMessage(this, MessageType.ENTER_ROOM, (client) => {
+        log.RegisterLoggedMessage(this, types.MessageType.ENTER_ROOM, (client) => {
             this.HandleEnterRoom(client);
         });
-        RegisterLoggedMessage<ReadyPayload>(this, MessageType.READY, (client, message) => {
+        log.RegisterLoggedMessage<ReadyPayload>(this, types.MessageType.READY, (client, message) => {
             this.HandleReady(client, message);
         });
-        RegisterLoggedMessage<SelectGamePayload>(this, MessageType.SELECT_GAME, (client, message) => {
+        log.RegisterLoggedMessage<SelectGamePayload>(this, types.MessageType.SELECT_GAME, (client, message) => {
             this.HandleSelectGame(client, message);
         });
-        RegisterLoggedMessage<ReplayPayload>(this, MessageType.GAME_RESULT, (client, message) => {
+        log.RegisterLoggedMessage<ReplayPayload>(this, types.MessageType.GAME_RESULT, (client, message) => {
             this.HandleReplay(client, message);
         });
     }
 
     public onJoin(client: Client, _options: unknown, auth?: GameSeatAuth): void {
         if (!auth?.user) {
-            // 정상 흐름이라면 항상 RoomManager 가 좌석 예약에 유저 정보를 담아 보낸다.
+            // 정상 흐름이라면 항상 GameRoomMatcher 가 좌석 예약에 유저 정보를 담아 보낸다.
             // 여기 걸리면 좌석 예약 없이(버그 또는 부정 접근으로) 들어온 것이다.
             console.error(`[GameRoom] auth.user 없이 입장 시도 sessionId=${client.sessionId}`);
             client.leave(CloseCode.WITH_ERROR);
@@ -153,7 +145,7 @@ export class GameRoom extends Room {
         }
 
         this.players.set(client.sessionId, auth.user);
-        LogConnect(this, client, { userid: auth.user.userid });
+        log.LogConnect(this, client, { userid: auth.user.userid });
         this.SaveMyActiveGameRecord(client, auth.user.userid);
         // ENTER_ROOM 응답은 소켓 입장 시점이 아니라, 클라이언트가 로딩을 끝내고 ENTER_ROOM 을
         // 보내온 뒤(HandleEnterRoom)에 보낸다 — 클라이언트마다 로딩 시간이 다를 수 있기 때문.
@@ -165,7 +157,7 @@ export class GameRoom extends Room {
             const waiting_client = this.clients.find((c) => c.sessionId !== client.sessionId);
             if (waiting_client) {
                 const opponent_payload: OpponentJoinedPayload = { player: ToRoomPlayerInfo(auth.user) };
-                SendMessage(this, waiting_client, MessageType.OPPONENT_JOINED, opponent_payload);
+                messages.SendMessage(this, waiting_client, types.MessageType.OPPONENT_JOINED, opponent_payload);
             }
             this.waiting_room_entry = null;
             this.waiting_session = null;
@@ -188,7 +180,7 @@ export class GameRoom extends Room {
             this.clock.setTimeout(() => {
                 this.bot_sessions.add(sessionId);
                 console.log(`[GameRoom] 봇 투입 roomId=${this.roomId} sessionId=${sessionId}`);
-            }, RECONNECT_WAIT_SEC * 1000)
+            }, constants.RECONNECT_WAIT_SEC * 1000)
         );
 
         // "manual" — 시간 제한은 우리가 직접 관리한다. RECONNECT_WAIT_SEC(5초)는 봇을 투입하는 시점일
@@ -216,7 +208,7 @@ export class GameRoom extends Room {
     }
 
     public onLeave(client: Client, code?: number): void {
-        LogDisconnect(this, client, code);
+        log.LogDisconnect(this, client, code);
         const left_user = this.players.get(client.sessionId);
         this.players.delete(client.sessionId);
         this.entered_by_session.delete(client.sessionId);
@@ -239,14 +231,14 @@ export class GameRoom extends Room {
         // 이 유저는 최종적으로 나갔다 — 로비가 더 이상 이 방으로 재접속을 안내하면 안 되므로 지운다.
         // (F5 로 로비에 다시 들어왔는데 이미 끝난/나간 방으로 안내되는 것을 막는다.)
         if (left_user) {
-            RemoveActiveGame(left_user.userid).catch((error) => {
+            activeGame.RemoveActiveGame(left_user.userid).catch((error) => {
                 console.error(`[GameRoom] RemoveActiveGame 실패 roomId=${this.roomId}:`, error instanceof Error ? error.message : error);
             });
             // 게임방을 떠날 때도 로비와 같은 규칙(CLAUDE.md 흐름 13번)을 따른다 — 값을 새로 쓰지 않고
             // TTL 만 다시 설정한다. 게임 결과가 막 저장돼 캐시가 이미 최신(FinishGame → RefreshUserCache)
             // 이어도 TTL 을 다시 거는 건 안전하다(idempotent).
-            GetUserCache(left_user.userid)
-                .then((cached) => (cached ? TouchUserCache(cached) : undefined))
+            userCache.GetUserCache(left_user.userid)
+                .then((cached) => (cached ? userCache.TouchUserCache(cached) : undefined))
                 .catch((error) => {
                     console.error(`[GameRoom] TouchUserCache 실패 roomId=${this.roomId}:`, error instanceof Error ? error.message : error);
                 });
@@ -255,7 +247,7 @@ export class GameRoom extends Room {
         if (this.waiting_room_entry && client.sessionId === this.waiting_session) {
             // 새 상대를 기다리던 그 유저가 나갔다 — Redis "기다리는 방" 목록에서도 지운다.
             // (다른 클라이언트의 onLeave 가 비동기로 뒤늦게 들어온 경우는 여기 해당 안 됨 — sessionId 로 구분)
-            RemoveWaitingRoom(this.waiting_room_entry).catch((error) => {
+            waitingRooms.RemoveWaitingRoom(this.waiting_room_entry).catch((error) => {
                 console.error(`[GameRoom] RemoveWaitingRoom 실패 roomId=${this.roomId}:`, error instanceof Error ? error.message : error);
             });
             this.waiting_room_entry = null;
@@ -269,7 +261,7 @@ export class GameRoom extends Room {
         if (left_user) {
             const payload: OutUserPayload = { userid: left_user.userid };
             for (const remaining_client of this.clients) {
-                SendMessage(this, remaining_client, MessageType.OUT_USER, payload);
+                messages.SendMessage(this, remaining_client, types.MessageType.OUT_USER, payload);
             }
         }
 
@@ -288,7 +280,7 @@ export class GameRoom extends Room {
     }
 
     public onDispose(): void {
-        UnregisterRoom(this);
+        roomRegistry.UnregisterRoom(this);
         console.log(`[GameRoom] 제거됨 roomId=${this.roomId}`);
     }
 
@@ -307,7 +299,7 @@ export class GameRoom extends Room {
             room_id: this.roomId,
             reconnection_token: client.reconnectionToken,
         };
-        SaveActiveGame(userid, entry).catch((error) => {
+        activeGame.SaveActiveGame(userid, entry).catch((error) => {
             console.error(`[GameRoom] SaveActiveGame 실패 roomId=${this.roomId}:`, error instanceof Error ? error.message : error);
         });
     }
@@ -323,14 +315,14 @@ export class GameRoom extends Room {
         if (this.game_started) {
             return;
         }
-        if (this.clients.length === PLAYERS_PER_ROOM) {
+        if (this.clients.length === constants.PLAYERS_PER_ROOM) {
             return; // 정상 — 2명 다 들어옴
         }
 
         if (this.clients.length === 1) {
             // 새로 만든 방에서 한 명만 들어온 경우 — 로비로 돌려보낸다.
             // ("기다리는 방"에 들어오기로 한 유저가 안 온 경우의 재등록 처리는 Phase 5 에서 추가)
-            SendMessage(this, this.clients[0], MessageType.RETURN_TO_LOBBY, {});
+            messages.SendMessage(this, this.clients[0], types.MessageType.RETURN_TO_LOBBY, {});
         }
 
         this.disconnect(CloseCode.WITH_ERROR);
@@ -348,7 +340,7 @@ export class GameRoom extends Room {
         this.entered_by_session.add(client.sessionId);
 
         // 상대가 아직 안 들어왔거나(최초) 완전히 나가서(재접속 실패까지 끝남) 없으면 응답할 수 없다
-        if (this.players.size < PLAYERS_PER_ROOM) return;
+        if (this.players.size < constants.PLAYERS_PER_ROOM) return;
 
         if (this.enter_room_sent) {
             this.SendEnterRoomTo(client);
@@ -378,7 +370,7 @@ export class GameRoom extends Room {
             player1: ToRoomPlayerInfo(user_a),
             player2: ToRoomPlayerInfo(user_b),
         };
-        SendMessage(this, client, MessageType.ENTER_ROOM, payload);
+        messages.SendMessage(this, client, types.MessageType.ENTER_ROOM, payload);
     }
 
     private HandleReady(client: Client, message: ReadyPayload): void {
@@ -389,7 +381,7 @@ export class GameRoom extends Room {
         this.ready_by_session.set(client.sessionId, message.ready === "Y");
 
         if (this.game_started) return; // 이미 시작된 뒤에는 더 반응하지 않는다
-        if (this.players.size < PLAYERS_PER_ROOM) return; // 아직 상대가 안 들어옴
+        if (this.players.size < constants.PLAYERS_PER_ROOM) return; // 아직 상대가 안 들어옴
 
         const all_ready = [...this.players.keys()].every(
             (sessionId) => this.ready_by_session.get(sessionId) === true
@@ -407,11 +399,11 @@ export class GameRoom extends Room {
         this.game_started_at = new Date();
         this.plays.length = 0;
         for (const room_client of this.clients) {
-            SendMessage(this, room_client, MessageType.GAME_START, {});
+            messages.SendMessage(this, room_client, types.MessageType.GAME_START, {});
         }
 
         // GAME_START 연출(모션)을 클라이언트가 처리할 시간을 준 뒤 첫 판 시작을 알린다
-        this.clock.setTimeout(() => this.SendOneStart(), GAME_START_DELAY_SEC * 1000);
+        this.clock.setTimeout(() => this.SendOneStart(), constants.GAME_START_DELAY_SEC * 1000);
     }
 
     // ONE_START (S→C) — 한 판을 시작한다. 이후 1초마다 ONE_REMAIN_TIME 으로 남은 초를 알리고,
@@ -420,21 +412,21 @@ export class GameRoom extends Room {
         // 상대가 완전히 나갔으면(OUT_USER 로 이미 알림) 판을 더 진행하지 않는다. 재접속 대기 중이거나
         // 봇이 대신하는 중인 세션은 onDrop 이후에도 players 에서 지우지 않으므로 이 가드에 걸리지 않고
         // 라운드가 그대로 진행된다(선택을 안 내면 아래 CHOICE_TIMEOUT_SEC 자동 선택으로 봇 역할을 한다).
-        if (this.players.size < PLAYERS_PER_ROOM || this.game_over) return;
+        if (this.players.size < constants.PLAYERS_PER_ROOM || this.game_over) return;
 
         this.choice_by_session.clear();
         this.round_active = true;
 
-        const start_payload: OneStartPayload = { count: CHOICE_TIMEOUT_SEC };
+        const start_payload: OneStartPayload = { count: constants.CHOICE_TIMEOUT_SEC };
         for (const client of this.clients) {
-            SendMessage(this, client, MessageType.ONE_START, start_payload);
+            messages.SendMessage(this, client, types.MessageType.ONE_START, start_payload);
         }
 
-        let remaining = CHOICE_TIMEOUT_SEC - 1;
+        let remaining = constants.CHOICE_TIMEOUT_SEC - 1;
         this.remain_time_interval = this.clock.setInterval(() => {
             const remain_payload: OneRemainTimePayload = { count: remaining };
             for (const client of this.clients) {
-                SendMessage(this, client, MessageType.ONE_REMAIN_TIME, remain_payload);
+                messages.SendMessage(this, client, types.MessageType.ONE_REMAIN_TIME, remain_payload);
             }
 
             if (remaining === 0) {
@@ -468,7 +460,7 @@ export class GameRoom extends Room {
         this.remain_time_interval?.clear();
         this.remain_time_interval = null;
 
-        if (this.players.size < PLAYERS_PER_ROOM) return; // 상대가 완전히 나가서(재접속 실패까지 끝남) 판정할 수 없음
+        if (this.players.size < constants.PLAYERS_PER_ROOM) return; // 상대가 완전히 나가서(재접속 실패까지 끝남) 판정할 수 없음
 
         for (const sessionId of this.players.keys()) {
             if (!this.choice_by_session.has(sessionId)) {
@@ -479,6 +471,8 @@ export class GameRoom extends Room {
         const [session_a, session_b] = [...this.players.keys()];
         const choice_a = this.choice_by_session.get(session_a)!;
         const choice_b = this.choice_by_session.get(session_b)!;
+        const userid_a = this.players.get(session_a)!.userid;
+        const userid_b = this.players.get(session_b)!.userid;
         const judge = JudgeChoice(choice_a, choice_b);
         const winner_session = judge === 1 ? session_a : judge === -1 ? session_b : null;
 
@@ -487,27 +481,25 @@ export class GameRoom extends Room {
             payload.win = this.players.get(winner_session)!.userid;
         }
         for (const client of this.clients) {
-            SendMessage(this, client, MessageType.ONE_RESULT, payload);
+            messages.SendMessage(this, client, types.MessageType.ONE_RESULT, payload);
         }
 
         if (!winner_session) {
             // 무승부 — 판 수에 넣지 않고 같은 판을 다시 진행. 결과를 보여줄 시간을 준 뒤 다음 ONE_START
-            this.plays.push({ draw: choice_a }); // 무승부는 둘이 같은 값을 낸 경우라 choice_a == choice_b
-            this.clock.setTimeout(() => this.SendOneStart(), ONE_RESULT_DELAY_SEC * 1000);
+            this.plays.push({ [userid_a]: choice_a, [userid_b]: choice_b });
+            this.clock.setTimeout(() => this.SendOneStart(), constants.ONE_RESULT_DELAY_SEC * 1000);
             return;
         }
 
-        const winner_choice = winner_session === session_a ? choice_a : choice_b;
-        const loser_choice = winner_session === session_a ? choice_b : choice_a;
-        this.plays.push({ win: winner_choice, lose: loser_choice });
+        this.plays.push({ [userid_a]: choice_a, [userid_b]: choice_b });
 
         const win_count = (this.win_count_by_session.get(winner_session) ?? 0) + 1;
         this.win_count_by_session.set(winner_session, win_count);
 
-        if (win_count >= WIN_COUNT_TO_FINISH) {
+        if (win_count >= constants.WIN_COUNT_TO_FINISH) {
             this.FinishGame(session_a, session_b);
         } else {
-            this.clock.setTimeout(() => this.SendOneStart(), ONE_RESULT_DELAY_SEC * 1000);
+            this.clock.setTimeout(() => this.SendOneStart(), constants.ONE_RESULT_DELAY_SEC * 1000);
         }
     }
 
@@ -550,16 +542,16 @@ export class GameRoom extends Room {
             },
         };
         for (const client of this.clients) {
-            SendMessage(this, client, MessageType.GAME_RESULT, payload);
+            messages.SendMessage(this, client, types.MessageType.GAME_RESULT, payload);
         }
 
         // 재게임/나가기 선택을 기다린다. REMATCH_CHOICE_TIMEOUT_SEC 안에 응답 없는 쪽은 나가기로 처리한다.
         // (아래 DB 저장을 기다리지 않고 먼저 시작한다 — 결과 화면/재게임 응답까지 DB 왕복 시간만큼 늦어지면 안 된다)
         this.replay_by_session.clear();
-        this.replay_timeout = this.clock.setTimeout(() => this.ResolveReplay(), REMATCH_CHOICE_TIMEOUT_SEC * 1000);
+        this.replay_timeout = this.clock.setTimeout(() => this.ResolveReplay(), constants.REMATCH_CHOICE_TIMEOUT_SEC * 1000);
 
         try {
-            const result = await SaveGameResult({
+            const result = await gameResultRepository.SaveGameResult({
                 winner_userid: winner_user.userid,
                 loser_userid: loser_user.userid,
                 loser_win_count: loser_count,
@@ -607,7 +599,7 @@ export class GameRoom extends Room {
     private KickToLobby(client: Client): void {
         if (this.kicked_to_lobby.has(client.sessionId)) return;
         this.kicked_to_lobby.add(client.sessionId);
-        SendMessage(this, client, MessageType.RETURN_TO_LOBBY, {});
+        messages.SendMessage(this, client, types.MessageType.RETURN_TO_LOBBY, {});
         client.leave(CloseCode.CONSENTED);
     }
 
@@ -626,7 +618,7 @@ export class GameRoom extends Room {
             if (client) this.KickToLobby(client);
         }
 
-        if (replaying_sessions.length === PLAYERS_PER_ROOM) {
+        if (replaying_sessions.length === constants.PLAYERS_PER_ROOM) {
             // 둘 다 재게임 — 같은 방, 같은 상대로 새 게임 시작 (다시 GAME_START 부터, READY 는 다시 안 받음)
             // (leaving_sessions.length 만으로는 판단하지 않는다 — 상대가 이미 연결이 끊겨 sessions 자체가
             //  1명뿐인 경우에도 leaving_sessions 는 비어 있을 수 있어서, "정말 둘 다 있고 둘 다 재게임"인지
@@ -668,14 +660,14 @@ export class GameRoom extends Room {
         this.game_started = false;
 
         const entry: WaitingRoomEntry = {
-            channel_no: ParseGameChannelNo(this.roomName),
+            channel_no: channelNames.ParseGameChannelNo(this.roomName),
             room_name: this.roomName,
             room_id: this.roomId,
             opponent: { name: remaining_user.name, avatar: remaining_user.avatar },
         };
         this.waiting_room_entry = entry;
         this.waiting_session = remaining_session;
-        PushWaitingRoom(entry).catch((error) => {
+        waitingRooms.PushWaitingRoom(entry).catch((error) => {
             console.error(`[GameRoom] PushWaitingRoom 실패 roomId=${this.roomId}:`, error instanceof Error ? error.message : error);
         });
     }

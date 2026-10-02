@@ -12,9 +12,9 @@
 // 동시 조회가 몰려도(사용자가 우려한 지점) 비용이 거의 안 늘어난다.
 
 import type { Pool } from "mysql2/promise";
-import { RANK_ZSET_TTL_SEC, RANKING_LIST_SIZE } from "../common/constants.js";
-import { GetAllRankRows } from "./queries/ranking.js";
-import { GetRedisClient } from "./redis.js";
+import * as constants from "../common/constants.js";
+import * as ranking from "./queries/ranking.js";
+import * as redis from "./redis.js";
 import type { RankPeriod } from "./types.js";
 
 function TodayDateStr(): string {
@@ -39,17 +39,17 @@ function GetZSetKey(period: RankPeriod): string {
 // ZINCRBY 로 키를 만들어 두므로 거의 호출될 일이 없다 — Redis 재시작처럼 드문 경우에만 실제로 채운다.
 async function EnsureZSet(pool: Pool, period: RankPeriod): Promise<string> {
     const key = GetZSetKey(period);
-    const redis = GetRedisClient();
+    const redis_client = redis.GetRedisClient();
 
-    const exists = await redis.exists(key);
+    const exists = await redis_client.exists(key);
     if (!exists) {
-        const rows = await GetAllRankRows(pool, period);
+        const rows = await ranking.GetAllRankRows(pool, period);
         if (rows.length > 0) {
             const args: (string | number)[] = [];
             for (const row of rows) args.push(row.score, row.userid);
-            await redis.zadd(key, ...args);
+            await redis_client.zadd(key, ...args);
         }
-        await redis.expire(key, RANK_ZSET_TTL_SEC);
+        await redis_client.expire(key, constants.RANK_ZSET_TTL_SEC);
     }
     return key;
 }
@@ -57,10 +57,10 @@ async function EnsureZSet(pool: Pool, period: RankPeriod): Promise<string> {
 // 게임 결과 반영 시(AddRankScore 와 함께) 호출한다 — MySQL 과 Redis 를 둘 다 갱신(dual write)한다.
 export async function IncrementRankScore(period: RankPeriod, userid: string, score: number): Promise<void> {
     const key = GetZSetKey(period);
-    const redis = GetRedisClient();
+    const redis_client = redis.GetRedisClient();
     // ZINCRBY 는 키/멤버가 없으면 그냥 새로 만들어 준다 — 평소 흐름에서는 이 한 줄로 ZSET 이 저절로 채워진다.
     // EXPIRE 를 매번 다시 걸어서(sliding) 활동이 있는 한 TTL 이 끊기지 않게 한다.
-    await redis.multi().zincrby(key, score, userid).expire(key, RANK_ZSET_TTL_SEC).exec();
+    await redis_client.multi().zincrby(key, score, userid).expire(key, constants.RANK_ZSET_TTL_SEC).exec();
 }
 
 export interface ZSetRankEntry {
@@ -71,7 +71,7 @@ export interface ZSetRankEntry {
 // 1~RANKING_LIST_SIZE(100)위 목록 — (userid, score) 만. 이름은 rankingRepository.ts 에서 별도로 붙인다.
 export async function GetTopRankEntries(pool: Pool, period: RankPeriod): Promise<ZSetRankEntry[]> {
     const key = await EnsureZSet(pool, period);
-    const raw = await GetRedisClient().zrevrange(key, 0, RANKING_LIST_SIZE - 1, "WITHSCORES");
+    const raw = await redis.GetRedisClient().zrevrange(key, 0, constants.RANKING_LIST_SIZE - 1, "WITHSCORES");
     const result: ZSetRankEntry[] = [];
     for (let i = 0; i < raw.length; i += 2) {
         result.push({ userid: raw[i], score: Number(raw[i + 1]) });
@@ -84,10 +84,10 @@ export async function GetTopRankEntries(pool: Pool, period: RankPeriod): Promise
 // 공동 순위가 유지된다. ZREVRANK 는 동점자도 서로 다른 순위를 매겨서 쓰지 않는다).
 export async function GetMyRankFromZSet(pool: Pool, period: RankPeriod, userid: string): Promise<{ rank: number; score: number }> {
     const key = await EnsureZSet(pool, period);
-    const redis = GetRedisClient();
+    const redis_client = redis.GetRedisClient();
 
-    const score_raw = await redis.zscore(key, userid);
+    const score_raw = await redis_client.zscore(key, userid);
     const score = score_raw !== null ? Number(score_raw) : 0;
-    const higher_count = await redis.zcount(key, `(${score}`, "+inf");
+    const higher_count = await redis_client.zcount(key, `(${score}`, "+inf");
     return { rank: higher_count + 1, score };
 }

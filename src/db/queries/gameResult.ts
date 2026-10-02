@@ -3,10 +3,13 @@
 
 import type { Pool } from "mysql2/promise";
 import type { Choice } from "../../common/types.js";
-import { EnsureGameLogTable } from "../gameLogSchema.js";
+import * as gameLogSchema from "../gameLogSchema.js";
 
-// game_log 의 plays 컬럼(JSON) 한 판 기록. 무승부 판도 포함한다 (gameLogSchema.ts 참고)
-export type PlayRecord = { win: Choice; lose: Choice } | { draw: Choice };
+// game_log 의 plays 컬럼(JSON) 한 판 기록. 무승부 판도 포함한다 (gameLogSchema.ts 참고).
+// userid → 그 유저가 낸 값. 승패 여부는 GameLogEntry 의 win/lose/vs 로 이미 알 수 있어서
+// (2026-10-02 변경) win/lose/draw 로 구분해 담지 않고, 누가 무엇을 냈는지만 기록한다 — 예전 구조는
+// "이겼다/졌다"만 알 수 있고 "누가(어떤 userid가)" 냈는지는 알 수 없어 기록으로서 가치가 없었다.
+export type PlayRecord = Record<string, Choice>;
 
 export interface GameLogEntry {
     start_time: Date;
@@ -86,7 +89,7 @@ export async function AddRankScore(pool: Pool, userid: string, score: number): P
 
 // game_log_YYYY_MM (end_time 이 속한 달 기준) 에 한 판(2선승제) 로그를 남긴다.
 export async function InsertGameLog(pool: Pool, entry: GameLogEntry): Promise<void> {
-    const table_name = await EnsureGameLogTable(pool, entry.end_time);
+    const table_name = await gameLogSchema.EnsureGameLogTable(pool, entry.end_time);
     await pool.query(
         `INSERT INTO \`${table_name}\`
             (start_time, end_time, win, lose, vs, score, plays, win_is_bot, lose_is_bot)

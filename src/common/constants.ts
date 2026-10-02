@@ -3,7 +3,7 @@
 // ── 규모 ──
 // ⚠️ 지금은 개발 단계라 로비/게임 1채널씩만 운영한다. 실 서비스 목표는 로비 2 / 게임 3 (CLAUDE.md 규모 스펙 참고).
 // 로비 채널 수는 .env 의 LOBBY_PORTS 목록 길이로 정해진다(channelNames.ts GetChannelPort 참고) — 여기엔
-// 상수가 없다. 게임 채널은 RoomManager 가 "몇 번까지 켜져 있을 수 있는지" 알아야 해서 상수로 둔다.
+// 상수가 없다. 게임 채널은 GameRoomMatcher 가 "몇 번까지 켜져 있을 수 있는지" 알아야 해서 상수로 둔다.
 // 운영 전환/증설 시 여기 값을 되돌리고, .env 의 GAME_PORTS 도 포트를 추가할 것 (LOBBY_PORTS 는 바로 추가 가능).
 export const GAME_CHANNEL_COUNT = 1;
 export const MAX_CLIENTS_PER_CHANNEL = 300;     // 로비/게임 채널별 최대 동시 접속

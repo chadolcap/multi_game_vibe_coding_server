@@ -6,33 +6,33 @@
 
 import type { Client, Room } from "@colyseus/core";
 import { CloseCode } from "@colyseus/core";
-import { MaskPhone } from "../../common/log.js";
-import { SendError, SendMessage, SendResult } from "../../common/messages.js";
-import { ContainsBannedWord, IsValidNameFormat } from "../../common/nameFilter.js";
-import {
-    EnterLobbyErrorCode,
-    ErrorCode,
-    MessageType,
-    NameErrorCode,
-    type EnterLobbyPayload,
-    type EnterLobbyResultPayload,
-    type JoinMatchPayload,
-    type MatchFoundPayload,
-    type NamePayload,
-    type PlayInfoResultPayload,
-    type RankDailyResultPayload,
-    type RankListEntry,
-    type RankWeeklyResultPayload,
-    type RejoinGamePayload,
-    type UserInfo,
+import * as log from "../../common/log.js";
+import * as messages from "../../common/messages.js";
+import * as nameFilter from "../../common/nameFilter.js";
+import * as types from "../../common/types.js";
+import type {
+    EnterLobbyPayload,
+    EnterLobbyResultPayload,
+    JoinMatchPayload,
+    MatchFoundPayload,
+    NamePayload,
+    PlayInfoResultPayload,
+    RankDailyResultPayload,
+    RankListEntry,
+    RankWeeklyResultPayload,
+    RejoinGamePayload,
+    UserInfo,
 } from "../../common/types.js";
-import { IsValidGender, IsValidMid, IsValidPartner, IsValidPhone, ConvertMidToUserid } from "../../common/userid.js";
-import { GetOrCreateUser, SetUserName } from "../../db/userRepository.js";
-import { GetUserCache, TouchUserCache } from "../../db/userCache.js";
-import { FetchRankDaily, FetchRankWeekly } from "../../db/rankingRepository.js";
+// ⚠️ 이 파일은 지역 변수로 "userid" 를 많이 쓰기 때문에, common/userid.js 모듈의 import alias 는
+// 관례(파일명 그대로)를 따르지 않고 "useridUtils" 로 바꿔서 섀도잉(가려짐)을 피한다.
+import * as useridUtils from "../../common/userid.js";
+import * as userRepository from "../../db/userRepository.js";
+import * as userCache from "../../db/userCache.js";
+import * as rankingRepository from "../../db/rankingRepository.js";
 import type { RankEntry } from "../../db/types.js";
-import { GetActiveGame, RemoveActiveGame } from "../room/activeGame.js";
-import { RoomManager, ToPublicOpponentInfo } from "../room/RoomManager.js";
+import * as activeGame from "../room/activeGame.js";
+import { GameRoomMatcher } from "../room/GameRoomMatcher.js";
+import * as gameRoomMatcher from "../room/GameRoomMatcher.js";
 
 // RankEntry(DB 조회 결과, { rank, userid, name, score }) → 문서 payload 형식인 [name, score] 튜플로 변환
 function ToRankListEntries(entries: RankEntry[]): RankListEntry[] {
@@ -52,10 +52,10 @@ function IsEnterLobbyShape(payload: unknown): payload is EnterLobbyPayload {
 
 function IsValidEnterLobbyFields(payload: EnterLobbyPayload): boolean {
     return (
-        IsValidPartner(payload.partner) &&
-        IsValidMid(payload.mid) &&
-        IsValidGender(payload.gender) &&
-        IsValidPhone(payload.phone)
+        useridUtils.IsValidPartner(payload.partner) &&
+        useridUtils.IsValidMid(payload.mid) &&
+        useridUtils.IsValidGender(payload.gender) &&
+        useridUtils.IsValidPhone(payload.phone)
     );
 }
 
@@ -75,7 +75,7 @@ export class LobbyManager {
     private readonly userid_by_session = new Map<string, string>();
     // "게임 참여"를 누르고 매칭을 기다리는 userid 목록 (도착한 순서대로)
     private readonly match_queue: string[] = [];
-    private readonly room_manager = new RoomManager();
+    private readonly game_room_matcher = new GameRoomMatcher();
 
     // ENTER_LOBBY 처리. 문서 기준(2026-09-30 갱신): 결과는 같은 type(ENTER_LOBBY)으로 응답하되,
     // 성공하면 { result:"Y", userid, new, name, avatar } 를 한 번에 보낸다(예전 LOBBY_ENTERED 는 폐지 —
@@ -85,7 +85,7 @@ export class LobbyManager {
         if (this.userid_by_session.has(client.sessionId)) {
             // 이미 입장한 연결이 또 보낸 경우 — 다른 중복 접속 경로(아래)와 똑같이 연결을 끊는다
             // (2026-10-01 정정: 예전엔 연결을 유지했는데, 사용자 지시로 일관되게 바꿨다)
-            SendResult(this.room, client, MessageType.ENTER_LOBBY, "N", EnterLobbyErrorCode.DUPLICATE_CONNECTION);
+            messages.SendResult(this.room, client, types.MessageType.ENTER_LOBBY, "N", types.EnterLobbyErrorCode.DUPLICATE_CONNECTION);
             client.leave(CloseCode.WITH_ERROR);
             return false;
         }
@@ -94,36 +94,36 @@ export class LobbyManager {
         if (!IsEnterLobbyShape(payload) || !IsValidEnterLobbyFields(payload)) {
             if (IsEnterLobbyShape(payload)) {
                 console.warn(
-                    `[LobbyManager] 형식 오류 partner=${payload.partner} gender=${payload.gender} phone=${MaskPhone(payload.phone)}`
+                    `[LobbyManager] 형식 오류 partner=${payload.partner} gender=${payload.gender} phone=${log.MaskPhone(payload.phone)}`
                 );
             }
-            SendResult(this.room, client, MessageType.ENTER_LOBBY, "N", EnterLobbyErrorCode.INVALID_FORMAT);
+            messages.SendResult(this.room, client, types.MessageType.ENTER_LOBBY, "N", types.EnterLobbyErrorCode.INVALID_FORMAT);
             client.leave(CloseCode.WITH_ERROR);
             return false;
         }
 
         if (!(await VerifyAuth(payload))) {
             // 1차 구현에서는 항상 통과한다 (VerifyAuth 주석 참고) — 토큰 검증 추가 시를 대비해 남겨 둔다
-            SendResult(this.room, client, MessageType.ENTER_LOBBY, "N", EnterLobbyErrorCode.OTHER);
+            messages.SendResult(this.room, client, types.MessageType.ENTER_LOBBY, "N", types.EnterLobbyErrorCode.OTHER);
             client.leave(CloseCode.WITH_ERROR);
             return false;
         }
 
-        const userid = ConvertMidToUserid(payload.partner, payload.mid);
+        const userid = useridUtils.ConvertMidToUserid(payload.partner, payload.mid);
 
         if (this.waiting_by_userid.has(userid)) {
             // 같은 계정이 이미 이 채널 로비에 대기 중 — 중복 접속
-            SendResult(this.room, client, MessageType.ENTER_LOBBY, "N", EnterLobbyErrorCode.DUPLICATE_CONNECTION);
+            messages.SendResult(this.room, client, types.MessageType.ENTER_LOBBY, "N", types.EnterLobbyErrorCode.DUPLICATE_CONNECTION);
             client.leave(CloseCode.WITH_ERROR);
             return false;
         }
 
         let result: { user: UserInfo; is_new_user: boolean };
         try {
-            result = await GetOrCreateUser(payload);
+            result = await userRepository.GetOrCreateUser(payload);
         } catch (error) {
             console.error("[LobbyManager] GetOrCreateUser 실패:", error instanceof Error ? error.message : error);
-            SendResult(this.room, client, MessageType.ENTER_LOBBY, "N", EnterLobbyErrorCode.DB_ERROR);
+            messages.SendResult(this.room, client, types.MessageType.ENTER_LOBBY, "N", types.EnterLobbyErrorCode.DB_ERROR);
             client.leave(CloseCode.WITH_ERROR);
             return false;
         }
@@ -138,7 +138,7 @@ export class LobbyManager {
             name: result.user.name,
             avatar: result.user.avatar,
         };
-        SendMessage(this.room, client, MessageType.ENTER_LOBBY, entered_payload);
+        messages.SendMessage(this.room, client, types.MessageType.ENTER_LOBBY, entered_payload);
 
         // 게임 중이던 유저가 F5 새로고침 등으로 소켓이 완전히 새로 열려 로비로 다시 들어온 경우 —
         // 평범한 로비 대기 대신 원래 게임방으로 돌아가라고 안내한다 (Phase 6-1, CLAUDE.md "F5 재접속" 참고).
@@ -149,22 +149,22 @@ export class LobbyManager {
         return true;
     }
 
-    // activeGame.ts 에 기록이 있으면 RoomManager 로 재접속을 시도해 REJOIN_GAME payload 를 만든다.
+    // activeGame.ts 에 기록이 있으면 GameRoomMatcher 로 재접속을 시도해 REJOIN_GAME payload 를 만든다.
     // 기록이 없거나(게임 중이 아님) 재접속이 실패하면(게임이 이미 끝났거나 방이 사라짐) null.
     private async TryBuildRejoinPayload(userid: string): Promise<RejoinGamePayload | null> {
-        const active_game = await GetActiveGame(userid);
+        const active_game = await activeGame.GetActiveGame(userid);
         if (!active_game) return null;
 
-        const rejoin = await this.room_manager.TryReconnectToGame(active_game);
+        const rejoin = await this.game_room_matcher.TryReconnectToGame(active_game);
         if (!rejoin) {
             // 낡은 기록(게임이 이미 끝났거나 방/프로세스가 사라짐) — 지워서 다음 ENTER_LOBBY 부터는
             // 평범하게 로비 입장이 되게 한다
-            await RemoveActiveGame(userid);
+            await activeGame.RemoveActiveGame(userid);
             return null;
         }
         // Colyseus 클라이언트 SDK 의 client.reconnect() 는 "roomId:reconnectionToken" 형식의 합성 문자열을
         // 받는다(SDK 가 room.reconnectionToken 을 저장할 때도 이 형식으로 만든다) — 그래서 여기서 미리
-        // 합쳐서 보낸다. RoomManager 가 들고 있는 reconnection_token 은 순수 토큰 값이다(matchMaker.reconnect()
+        // 합쳐서 보낸다. GameRoomMatcher 가 들고 있는 reconnection_token 은 순수 토큰 값이다(matchMaker.reconnect()
         // 검증 호출에는 순수 토큰이 필요하다).
         return {
             room_name: rejoin.room_name,
@@ -178,7 +178,7 @@ export class LobbyManager {
         this.waiting_by_userid.delete(userid);
         this.userid_by_session.delete(client.sessionId);
 
-        SendMessage(this.room, client, MessageType.REJOIN_GAME, payload);
+        messages.SendMessage(this.room, client, types.MessageType.REJOIN_GAME, payload);
         client.leave(CloseCode.CONSENTED);
     }
 
@@ -195,32 +195,32 @@ export class LobbyManager {
         const payload = raw_message as Partial<NamePayload> | null;
         const raw_name = typeof payload === "object" && payload !== null ? payload.name : undefined;
 
-        if (!IsValidNameFormat(raw_name)) {
-            SendResult(this.room, client, MessageType.NAME, "N", NameErrorCode.INAPPROPRIATE);
+        if (!nameFilter.IsValidNameFormat(raw_name)) {
+            messages.SendResult(this.room, client, types.MessageType.NAME, "N", types.NameErrorCode.INAPPROPRIATE);
             return;
         }
         const trimmed_name = raw_name.trim();
-        if (ContainsBannedWord(trimmed_name)) {
-            SendResult(this.room, client, MessageType.NAME, "N", NameErrorCode.INAPPROPRIATE);
+        if (nameFilter.ContainsBannedWord(trimmed_name)) {
+            messages.SendResult(this.room, client, types.MessageType.NAME, "N", types.NameErrorCode.INAPPROPRIATE);
             return;
         }
 
         let db_result: "ok" | "duplicate";
         try {
-            db_result = await SetUserName(userid, trimmed_name);
+            db_result = await userRepository.SetUserName(userid, trimmed_name);
         } catch (error) {
             console.error("[LobbyManager] SetUserName 실패:", error instanceof Error ? error.message : error);
-            SendResult(this.room, client, MessageType.NAME, "N", NameErrorCode.SERVER_ERROR);
+            messages.SendResult(this.room, client, types.MessageType.NAME, "N", types.NameErrorCode.SERVER_ERROR);
             return;
         }
 
         if (db_result === "duplicate") {
-            SendResult(this.room, client, MessageType.NAME, "N", NameErrorCode.DUPLICATE);
+            messages.SendResult(this.room, client, types.MessageType.NAME, "N", types.NameErrorCode.DUPLICATE);
             return;
         }
 
         entry.user = { ...entry.user, name: trimmed_name };
-        SendResult(this.room, client, MessageType.NAME, "Y");
+        messages.SendResult(this.room, client, types.MessageType.NAME, "Y");
     }
 
     // PLAY_INFO 처리 (게임 정보 통신). 이 세션이 ENTER_LOBBY 때 이미 들고 있는 UserInfo 를 그대로
@@ -240,7 +240,7 @@ export class LobbyManager {
             today_game_count: entry.user.today_game_count,
             today_win_count: entry.user.today_win_count,
         };
-        SendMessage(this.room, client, MessageType.PLAY_INFO, payload);
+        messages.SendMessage(this.room, client, types.MessageType.PLAY_INFO, payload);
     }
 
     // RANK_DAILY/RANK_WEEKLY 처리 (Phase 8, 2026-10-01 통신규약 시트 기준). PLAY_INFO 와 같은 패턴으로
@@ -250,26 +250,26 @@ export class LobbyManager {
         const userid = this.userid_by_session.get(client.sessionId);
         if (!userid) return;
 
-        const { date, rank_list, my_rank, my_score } = await FetchRankDaily(userid);
+        const { date, rank_list, my_rank, my_score } = await rankingRepository.FetchRankDaily(userid);
         const payload: RankDailyResultPayload = {
             date,
             list: ToRankListEntries(rank_list),
             my: { rank: my_rank, score: my_score },
         };
-        SendMessage(this.room, client, MessageType.RANK_DAILY, payload);
+        messages.SendMessage(this.room, client, types.MessageType.RANK_DAILY, payload);
     }
 
     public async HandleRankWeekly(client: Client): Promise<void> {
         const userid = this.userid_by_session.get(client.sessionId);
         if (!userid) return;
 
-        const { term, rank_list, my_rank, my_score } = await FetchRankWeekly(userid);
+        const { term, rank_list, my_rank, my_score } = await rankingRepository.FetchRankWeekly(userid);
         const payload: RankWeeklyResultPayload = {
             term,
             list: ToRankListEntries(rank_list),
             my: { rank: my_rank, score: my_score },
         };
-        SendMessage(this.room, client, MessageType.RANK_WEEKLY, payload);
+        messages.SendMessage(this.room, client, types.MessageType.RANK_WEEKLY, payload);
     }
 
     // 연결이 끊겼을 때 (ENTER_LOBBY 이전에 끊겼으면 등록된 게 없어 아무 일도 하지 않는다)
@@ -282,9 +282,9 @@ export class LobbyManager {
         this.RemoveFromMatchQueue(userid);
 
         // 떠날 때는 값을 다시 쓰지 않고 TTL 만 다시 설정한다 (CLAUDE.md 흐름 13번)
-        const cached = await GetUserCache(userid);
+        const cached = await userCache.GetUserCache(userid);
         if (cached) {
-            await TouchUserCache(cached);
+            await userCache.TouchUserCache(cached);
         }
         // cached 가 없다면(드물게 대기 중 TTL 이 이미 지난 경우) 그냥 둔다 — 다음 ENTER_LOBBY 때 DB 에서 다시 채워진다
     }
@@ -336,7 +336,7 @@ export class LobbyManager {
             }
 
             // 1) 상대를 기다리는 방이 있으면 그 방에 먼저 넣는다 (Phase 5 전까지는 항상 없음 — 정상)
-            const waiting_match = await this.room_manager.TryJoinWaitingRoom(first_entry.user);
+            const waiting_match = await this.game_room_matcher.TryJoinWaitingRoom(first_entry.user);
             if (waiting_match) {
                 this.match_queue.shift();
                 this.SendMatchFoundAndLeave(first_entry.client, first_entry.user.userid, {
@@ -360,11 +360,11 @@ export class LobbyManager {
 
             this.match_queue.splice(0, 2);
 
-            const new_match = await this.room_manager.CreateRoomForTwo(first_entry.user, second_entry.user);
+            const new_match = await this.game_room_matcher.CreateRoomForTwo(first_entry.user, second_entry.user);
             if (!new_match) {
                 // 게임 채널 3개 모두 꽉 참 — 둘 다 로비에 남는다(연결 유지). 다시 매칭하려면 JOIN_MATCH 를 또 보내야 한다.
-                SendError(this.room, first_entry.client, ErrorCode.NO_GAME_ROOM, "접속 가능한 게임방이 없습니다. 잠시 후 다시 참여 해 주세요.");
-                SendError(this.room, second_entry.client, ErrorCode.NO_GAME_ROOM, "접속 가능한 게임방이 없습니다. 잠시 후 다시 참여 해 주세요.");
+                messages.SendError(this.room, first_entry.client, types.ErrorCode.NO_GAME_ROOM, "접속 가능한 게임방이 없습니다. 잠시 후 다시 참여 해 주세요.");
+                messages.SendError(this.room, second_entry.client, types.ErrorCode.NO_GAME_ROOM, "접속 가능한 게임방이 없습니다. 잠시 후 다시 참여 해 주세요.");
                 continue;
             }
 
@@ -372,13 +372,13 @@ export class LobbyManager {
                 room_name: new_match.room_name,
                 room_id: new_match.room_id,
                 seat_reservation: new_match.reservation_a,
-                opponent: ToPublicOpponentInfo(second_entry.user),
+                opponent: gameRoomMatcher.ToPublicOpponentInfo(second_entry.user),
             });
             this.SendMatchFoundAndLeave(second_entry.client, second_entry.user.userid, {
                 room_name: new_match.room_name,
                 room_id: new_match.room_id,
                 seat_reservation: new_match.reservation_b,
-                opponent: ToPublicOpponentInfo(first_entry.user),
+                opponent: gameRoomMatcher.ToPublicOpponentInfo(first_entry.user),
             });
         }
     }
@@ -388,7 +388,7 @@ export class LobbyManager {
         this.waiting_by_userid.delete(userid);
         this.userid_by_session.delete(client.sessionId);
 
-        SendMessage(this.room, client, MessageType.MATCH_FOUND, payload);
+        messages.SendMessage(this.room, client, types.MessageType.MATCH_FOUND, payload);
         client.leave(CloseCode.CONSENTED);
     }
 }

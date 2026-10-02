@@ -25,8 +25,8 @@
 
 import { matchMaker } from "@colyseus/core";
 import type { ChannelType } from "../common/channelNames.js";
-import { CHANNEL_HEARTBEAT_INTERVAL_SEC, CHANNEL_HEARTBEAT_TTL_SEC } from "../common/constants.js";
-import { GetRedisClient } from "./redis.js";
+import * as constants from "../common/constants.js";
+import * as redis from "./redis.js";
 
 function GetHeartbeatKey(channel_type: ChannelType, channel_no: number): string {
     return `channel:${channel_type}:${channel_no}:alive`;
@@ -38,11 +38,11 @@ function GetHeartbeatKey(channel_type: ChannelType, channel_no: number): string 
 // 바로 알 수 있게 한다(이전엔 단순히 "1" 만 저장했다).
 export async function StartChannelHeartbeat(channel_type: ChannelType, channel_no: number, process_id: string): Promise<void> {
     const key = GetHeartbeatKey(channel_type, channel_no);
-    const redis = GetRedisClient();
+    const redis_client = redis.GetRedisClient();
 
     const Beat = async (): Promise<void> => {
         try {
-            await redis.set(key, process_id, "EX", CHANNEL_HEARTBEAT_TTL_SEC);
+            await redis_client.set(key, process_id, "EX", constants.CHANNEL_HEARTBEAT_TTL_SEC);
         } catch (error) {
             console.error(`[채널 하트비트] ${key} 갱신 실패:`, error instanceof Error ? error.message : error);
         }
@@ -51,17 +51,17 @@ export async function StartChannelHeartbeat(channel_type: ChannelType, channel_n
     // SelectProcessIdForRoom 이 이 채널의 하트비트를 조회하므로, 이 SET 이 아직 Redis 에 반영되기 전에
     // 조회가 먼저 일어나는 경합을 막는다.
     await Beat();
-    setInterval(Beat, CHANNEL_HEARTBEAT_INTERVAL_SEC * 1000);
+    setInterval(Beat, constants.CHANNEL_HEARTBEAT_INTERVAL_SEC * 1000);
 }
 
 // 1..max_channel_no 중 지금 하트비트가 살아있는 게임 채널 번호만 돌려준다.
-// RoomManager 가 새 게임방을 만들 채널을 고를 때 이 목록에 있는 채널만 시도한다.
+// GameRoomMatcher 가 새 게임방을 만들 채널을 고를 때 이 목록에 있는 채널만 시도한다.
 export async function GetAliveGameChannels(max_channel_no: number): Promise<number[]> {
     if (max_channel_no <= 0) return [];
 
     const channel_numbers = Array.from({ length: max_channel_no }, (_, i) => i + 1);
     const keys = channel_numbers.map((channel_no) => GetHeartbeatKey("game", channel_no));
-    const values = await GetRedisClient().mget(...keys);
+    const values = await redis.GetRedisClient().mget(...keys);
     return channel_numbers.filter((_, i) => values[i] !== null);
 }
 
@@ -72,13 +72,13 @@ export async function GetAliveGameChannels(max_channel_no: number): Promise<numb
 // matchMaker.createRoom("watcher", ...) 가 라우팅돼 "provided room name not defined")가 재현된다.
 async function GetChannelProcessId(room_name: string): Promise<string | null> {
     if (room_name === "watcher") {
-        return GetRedisClient().get(GetHeartbeatKey("watcher", 1));
+        return redis.GetRedisClient().get(GetHeartbeatKey("watcher", 1));
     }
     const match = /^(lobby|game)_(\d+)$/.exec(room_name);
     if (!match) return null;
     const channel_type = match[1] as ChannelType;
     const channel_no = Number(match[2]);
-    return GetRedisClient().get(GetHeartbeatKey(channel_type, channel_no));
+    return redis.GetRedisClient().get(GetHeartbeatKey(channel_type, channel_no));
 }
 
 // Colyseus 의 기본 selectProcessIdToCreateRoom 을 대체하는 콜백 — `index.ts` 에서

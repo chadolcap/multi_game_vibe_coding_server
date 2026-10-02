@@ -3,7 +3,7 @@
 // - Colyseus 룸 이름은 채널마다 따로 등록하며, 채널별 통계도 이 이름으로 구분한다.
 
 import { config } from "./config.js";
-import { GAME_CHANNEL_COUNT } from "./constants.js";
+import * as constants from "./constants.js";
 
 export type ChannelType = "watcher" | "lobby" | "game";
 
@@ -47,9 +47,9 @@ export function GetChannelPort(channel_type: ChannelType, channel_no: number): n
     // 길이로 정한다 — 로비 채널은 서로 독립적이라(매칭 시 다른 로비 채널을 알 필요 없음) 다른 프로세스가
     // "몇 개인지"를 알아야 할 이유가 없다. 그래서 트래픽이 몰릴 때 .env 에 포트만 추가하고 그 채널
     // 프로세스만 새로 띄우면 되고, 코드 수정/재빌드나 이미 떠 있는 다른 채널 재시작이 필요 없다.
-    // (게임 채널은 RoomManager 가 "지금 켜진 채널 몇 번까지 있는지"를 알아야 해서 GAME_CHANNEL_COUNT 를
+    // (게임 채널은 GameRoomMatcher 가 "지금 켜진 채널 몇 번까지 있는지"를 알아야 해서 GAME_CHANNEL_COUNT 를
     // 그대로 쓴다 — CLAUDE.md "로비/게임 채널 늘리기" 참고)
-    const channel_count = channel_type === "lobby" ? ports.length : GAME_CHANNEL_COUNT;
+    const channel_count = channel_type === "lobby" ? ports.length : constants.GAME_CHANNEL_COUNT;
 
     if (!Number.isInteger(channel_no) || channel_no < 1 || channel_no > channel_count) {
         throw new Error(`${channel_type} 채널 번호는 1~${channel_count} 이어야 합니다: ${channel_no}`);

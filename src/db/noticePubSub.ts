@@ -9,9 +9,10 @@
 
 import { Redis } from "ioredis";
 import { config } from "../common/config.js";
-import { SendMessage } from "../common/messages.js";
-import { GetRegisteredRooms } from "../common/roomRegistry.js";
-import { MessageType, type NoticePayload } from "../common/types.js";
+import * as messages from "../common/messages.js";
+import * as roomRegistry from "../common/roomRegistry.js";
+import * as types from "../common/types.js";
+import type { NoticePayload } from "../common/types.js";
 
 const NOTICE_CHANNEL = "notice:broadcast";
 
@@ -58,9 +59,9 @@ export function SubscribeNotice(room_name: string): void {
         if (!broadcast.channels.includes(room_name)) return; // 이 채널은 대상이 아니다
 
         const payload: NoticePayload = { message: broadcast.message };
-        for (const room of GetRegisteredRooms()) {
+        for (const room of roomRegistry.GetRegisteredRooms()) {
             for (const client of room.clients) {
-                SendMessage(room, client, MessageType.SEND_NOTICE, payload);
+                messages.SendMessage(room, client, types.MessageType.SEND_NOTICE, payload);
             }
         }
     });

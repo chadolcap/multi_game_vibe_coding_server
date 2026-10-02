@@ -3,22 +3,22 @@
 // 로컬 엑셀본 "관리자" 시트 기준. ADMIN_LOGIN/SEND_NOTICE 는 그 시트에 아직 없어 CLAUDE.md 가 기준이다.
 
 import { CloseCode, matchMaker, type Client, type Room } from "@colyseus/core";
-import { GetGameRoomName, GetLobbyRoomName } from "../common/channelNames.js";
+import * as channelNames from "../common/channelNames.js";
 import { config } from "../common/config.js";
-import { GAME_CHANNEL_COUNT, NOTICE_REPEAT_INTERVAL_SEC } from "../common/constants.js";
-import { SendMessage } from "../common/messages.js";
-import {
-    MessageType,
-    type AdminChannelCountPayload,
-    type AdminChannelUserQuery,
-    type AdminChannelUserResultPayload,
-    type AdminLoginPayload,
-    type AdminLoginResultPayload,
-    type NoticeTimeRange,
-    type SendNoticePayload,
+import * as constants from "../common/constants.js";
+import * as messages from "../common/messages.js";
+import * as types from "../common/types.js";
+import type {
+    AdminChannelCountPayload,
+    AdminChannelUserQuery,
+    AdminChannelUserResultPayload,
+    AdminLoginPayload,
+    AdminLoginResultPayload,
+    NoticeTimeRange,
+    SendNoticePayload,
 } from "../common/types.js";
-import { GetChannelUsers } from "../db/channelUsers.js";
-import { PublishNotice } from "../db/noticePubSub.js";
+import * as channelUsers from "../db/channelUsers.js";
+import * as noticePubSub from "../db/noticePubSub.js";
 
 // "HH:MM" 을 that time.mon/time.day(연도는 지금 연도)의 Date 로 만든다. 형식이 틀리면 null.
 function ParseNoticeTime(time: NoticeTimeRange, hhmm: string): Date | null {
@@ -40,12 +40,12 @@ async function ComputeChannelCounts(): Promise<Record<string, number>> {
     const counts: Record<string, number> = {};
 
     for (let channel_no = 1; channel_no <= config.lobby_ports.length; channel_no++) {
-        const room_name = GetLobbyRoomName(channel_no);
+        const room_name = channelNames.GetLobbyRoomName(channel_no);
         const rooms = await matchMaker.query({ name: room_name });
         counts[room_name] = rooms.reduce((sum, room) => sum + room.clients, 0);
     }
-    for (let channel_no = 1; channel_no <= GAME_CHANNEL_COUNT; channel_no++) {
-        const room_name = GetGameRoomName(channel_no);
+    for (let channel_no = 1; channel_no <= constants.GAME_CHANNEL_COUNT; channel_no++) {
+        const room_name = channelNames.GetGameRoomName(channel_no);
         const rooms = await matchMaker.query({ name: room_name });
         counts[room_name] = rooms.reduce((sum, room) => sum + room.clients, 0);
     }
@@ -71,7 +71,7 @@ export class WatcherManager {
             message.password === config.admin_password;
 
         const payload: AdminLoginResultPayload = { result: ok ? "Y" : "N" };
-        SendMessage(this.room, client, MessageType.ADMIN_LOGIN, payload);
+        messages.SendMessage(this.room, client, types.MessageType.ADMIN_LOGIN, payload);
 
         if (ok) {
             this.logged_in_sessions.add(client.sessionId);
@@ -86,22 +86,22 @@ export class WatcherManager {
 
         const count = await ComputeChannelCounts();
         const payload: AdminChannelCountPayload = { count };
-        SendMessage(this.room, client, MessageType.ADMIN_CHANNEL_COUNT, payload);
+        messages.SendMessage(this.room, client, types.MessageType.ADMIN_CHANNEL_COUNT, payload);
     }
 
     public async HandleChannelUser(client: Client, message: AdminChannelUserQuery): Promise<void> {
         if (!this.RequireLoggedIn(client)) return;
         if (message?.lobby === undefined && message?.game === undefined) return; // 형식 오류 — 무시
 
-        const room_name = message.lobby !== undefined ? GetLobbyRoomName(message.lobby) : GetGameRoomName(message.game!);
-        const users = await GetChannelUsers(room_name);
+        const room_name = message.lobby !== undefined ? channelNames.GetLobbyRoomName(message.lobby) : channelNames.GetGameRoomName(message.game!);
+        const users = await channelUsers.GetChannelUsers(room_name);
 
         const payload: AdminChannelUserResultPayload = {
             ...(message.lobby !== undefined ? { lobby: message.lobby } : { game: message.game }),
             user: users,
             total: users.length,
         };
-        SendMessage(this.room, client, MessageType.ADMIN_CHANNEL_USER, payload);
+        messages.SendMessage(this.room, client, types.MessageType.ADMIN_CHANNEL_USER, payload);
     }
 
     // SEND_NOTICE — 응답 없음(발사 후 잊기). message.channel 에 담긴 room_name(예: "lobby_1")들에만
@@ -119,7 +119,7 @@ export class WatcherManager {
             return;
         }
 
-        await PublishNotice(message.message, message.channel);
+        await noticePubSub.PublishNotice(message.message, message.channel);
     }
 
     // start~end 구간 동안 NOTICE_REPEAT_INTERVAL_SEC 간격으로 반복 전송을 예약한다. start 가 이미
@@ -137,7 +137,7 @@ export class WatcherManager {
         if (end <= now) return; // 이미 끝난 시간대 — 무시
 
         const SendOnce = (): void => {
-            PublishNotice(message, channels).catch((error) => {
+            noticePubSub.PublishNotice(message, channels).catch((error) => {
                 console.error("[WatcherManager] 반복 공지 전송 실패:", error instanceof Error ? error.message : error);
             });
         };
@@ -151,7 +151,7 @@ export class WatcherManager {
                     return;
                 }
                 SendOnce();
-            }, NOTICE_REPEAT_INTERVAL_SEC * 1000);
+            }, constants.NOTICE_REPEAT_INTERVAL_SEC * 1000);
         }, delay_to_start_ms);
     }
 

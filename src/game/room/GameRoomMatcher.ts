@@ -2,11 +2,11 @@
 // Redis 기반 Presence/Driver 를 통해 다른 프로세스(게임 채널)의 방에 좌석을 예약한다).
 
 import { matchMaker } from "@colyseus/core";
-import { GAME_CHANNEL_COUNT, MAX_ROOMS_PER_GAME_CHANNEL } from "../../common/constants.js";
-import { GetGameRoomName } from "../../common/channelNames.js";
+import * as constants from "../../common/constants.js";
+import * as channelNames from "../../common/channelNames.js";
 import type { GameSeatAuth, OpponentInfo, SeatReservation, UserInfo } from "../../common/types.js";
-import { GetAliveGameChannels } from "../../db/channelHeartbeat.js";
-import { PopWaitingRoom } from "./waitingRooms.js";
+import * as channelHeartbeat from "../../db/channelHeartbeat.js";
+import * as waitingRooms from "./waitingRooms.js";
 import type { ActiveGameEntry } from "./types.js";
 
 export interface NewRoomMatch {
@@ -33,7 +33,7 @@ function ToPublicOpponentInfo(user: UserInfo): OpponentInfo {
     return { name: user.name, avatar: user.avatar };
 }
 
-export class RoomManager {
+export class GameRoomMatcher {
     // 게임 중이던 유저가 (F5 등으로) 로비를 거쳐 다시 들어왔을 때, activeGame.ts 에 저장해 둔 재접속
     // 토큰이 아직 유효한지 확인한다.
     // ⚠️ matchMaker.reconnect() 가 돌려주는 값(ISeatReservation)에는 reconnectionToken 필드가 없다 —
@@ -49,7 +49,7 @@ export class RoomManager {
             return { room_name: active_game.room_name, room_id: active_game.room_id, reconnection_token: active_game.reconnection_token };
         } catch (error) {
             console.warn(
-                `[RoomManager] 게임 재접속 확인 실패, 평범한 로비 입장으로 진행 (room_id=${active_game.room_id}):`,
+                `[GameRoomMatcher] 게임 재접속 확인 실패, 평범한 로비 입장으로 진행 (room_id=${active_game.room_id}):`,
                 error instanceof Error ? error.message : error
             );
             return null;
@@ -58,7 +58,7 @@ export class RoomManager {
 
     // "기다리는 방"이 있으면 유저 1명을 그 방에 넣는다. 없거나(정상) 실패하면(경합 등, 드묾) null.
     public async TryJoinWaitingRoom(user: UserInfo): Promise<WaitingRoomMatch | null> {
-        const entry = await PopWaitingRoom();
+        const entry = await waitingRooms.PopWaitingRoom();
         if (!entry) return null;
 
         try {
@@ -73,7 +73,7 @@ export class RoomManager {
         } catch (error) {
             // 그 사이 방이 사라졌거나(상대가 나감) 꽉 찬 경우 — 드문 경합. 이 유저는 새 방 매칭으로 넘어가면 된다.
             console.warn(
-                `[RoomManager] 기다리는 방 입장 실패, 새 매칭으로 넘어감 (room_id=${entry.room_id}):`,
+                `[GameRoomMatcher] 기다리는 방 입장 실패, 새 매칭으로 넘어감 (room_id=${entry.room_id}):`,
                 error instanceof Error ? error.message : error
             );
             return null;
@@ -90,13 +90,13 @@ export class RoomManager {
     // defined" 로 실패하는 문제가 실제로 있었다 — Colyseus 자체에는 "어떤 프로세스가 어떤 룸 이름을
     // 처리하는지" 클러스터 전체에서 조회할 방법이 없어서, 하트비트를 직접 만들어 확인한다.
     public async CreateRoomForTwo(user_a: UserInfo, user_b: UserInfo): Promise<NewRoomMatch | null> {
-        const alive_channel_numbers = await GetAliveGameChannels(GAME_CHANNEL_COUNT);
+        const alive_channel_numbers = await channelHeartbeat.GetAliveGameChannels(constants.GAME_CHANNEL_COUNT);
 
         for (const channel_no of alive_channel_numbers) {
-            const room_name = GetGameRoomName(channel_no);
+            const room_name = channelNames.GetGameRoomName(channel_no);
 
             const existing_rooms = await matchMaker.query({ name: room_name });
-            if (existing_rooms.length >= MAX_ROOMS_PER_GAME_CHANNEL) {
+            if (existing_rooms.length >= constants.MAX_ROOMS_PER_GAME_CHANNEL) {
                 continue; // 이 채널 꽉 참 — 다음 채널 시도
             }
 
@@ -106,7 +106,7 @@ export class RoomManager {
                 const reservation_b = await matchMaker.reserveSeatFor(room_cache, {}, { user: user_b } satisfies GameSeatAuth);
                 return { room_name, room_id: room_cache.roomId, reservation_a, reservation_b };
             } catch (error) {
-                console.error(`[RoomManager] ${room_name} 방 생성/좌석 예약 실패:`, error instanceof Error ? error.message : error);
+                console.error(`[GameRoomMatcher] ${room_name} 방 생성/좌석 예약 실패:`, error instanceof Error ? error.message : error);
                 // 이 채널에서 문제가 생기면 다음 채널로 넘어간다
             }
         }
